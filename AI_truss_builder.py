@@ -918,10 +918,17 @@ def main():
             pygame.display.flip()
             pygame.event.pump()   # keep window responsive
 
-            new_m,new_f,new_b,log,opt_len=run_astar(
-                anchors,loads,p,load_angles,
-                fixed_members=fixed,
-                blacklist=blacklist)
+            t_start = time.time()
+
+            new_m, new_f, new_b, log, opt_len = run_astar(
+                anchors, loads, noloads, p,
+                load_angles, load_magnitudes,
+                fixed_members=fixed, blacklist=blacklist)
+            t_end = time.time()
+            print(f"Attempt {attempt} | Solve time: {t_end - t_start:.2f}s | "
+                    f"Members: {len(new_m)} | Nodes: {len(anchors)} anchors, "
+                    f"{len(loads)} loads")
+
             for line in log: print(line)
 
             # Rebuild member list
