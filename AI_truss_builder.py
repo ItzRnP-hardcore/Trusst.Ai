@@ -1,68 +1,74 @@
 """
-AI Truss Builder — A* + Live Settings Panel  (v2)
+AI Truss Builder — A* + Live Settings Panel  (v5)
 ==================================================
-Key changes from v1
--------------------
-  1. A* search is NO LONGER pruned by L_max / Euler buckling.
-     Members of any length are explored.  The solver only prunes
-     on connectivity and node-degree limits.
+v5 Additions
+------------
+  ZOOM & PAN VIEWPORT
+    The canvas now has a full 2-D viewport transform so you can zoom in to
+    inspect joint details and pan to use a much larger working area.
 
-  2. POST-SOLVE BUCKLING LOOP
-     After A* finds a geometry solution the statics solver checks
-     buckling.  If any member buckles the buckled solution is SHOWN
-     briefly (purple members), then the search restarts with that
-     member-set BLACKLISTED so A* finds the next-best topology.
-     This repeats until a non-buckling solution is found or the
-     search is exhausted.
+    Controls
+    ~~~~~~~~
+      Mouse wheel          Zoom in / out (centred on cursor)
+      Middle-click drag    Pan the canvas
+      Right-click drag     Also pans (when NOT over a node)
+      Home / H             Reset zoom & pan to default view
+      +  /  -  (numpad)   Zoom in / out by fixed steps
 
-  3. PER-MEMBER MINIMUM SIZING  (volume optimisation)
-     After a valid solution is found, each member is individually
-     sized to the MINIMUM outer radius + wall thickness (keeping the
-     t/r ratio of the global cross-section) that simultaneously
-     satisfies:
-       • Tensile / compressive yield   |F| <= sigma_y * A
-       • Euler buckling (SF applied)   |F| <= P_cr / SF
-     The resulting minimum area, radius, and volume are stored and
-     shown in the per-member labels (toggle with F key).
+    All node coordinates are stored in **world space** (the same pixel units
+    as before, at zoom=1).  The viewport transform is purely visual.
 
-Per-node load angle editing
-----------------------------
-  In LOAD mode, LEFT-CLICK an existing load node to SELECT it.
-  Then use ANY of these to set its force direction:
-    Mouse-wheel         rotate ±5° per tick
-    Left / Right        rotate ±1°
-    Up / Down           rotate ±15°
-    Hold Shift          ×10 multiplier on arrow keys
-    Click elsewhere     place a new load node (deselects first)
-  A live angle dial and degree readout are drawn next to the
-  selected node.
+    Technical notes
+    ~~~~~~~~~~~~~~~
+      world_to_screen(wx, wy) = (wx * zoom + pan_x,  wy * zoom + pan_y)
+      screen_to_world(sx, sy) = ((sx - pan_x) / zoom, (sy - pan_y) / zoom)
 
-Controls
----------
-  A           Anchor mode           L  Load mode
-  M           Manual member mode    S  Settings panel
-  SPACE       Run A* solver         F  Cycle force labels
-  R           Reset auto members    C  Clear all
-  Q / Esc     Quit                  Right-click  Remove node
+    Node snapping, member hit-testing, load-arrow drawing, and all placement
+    logic operate in world space.  Only the final pygame draw calls are in
+    screen space.
+
+v4 Optimizations (search algorithm overhaul — unchanged)
+---------------------------------------------------------
+  Zobrist hashing · Steiner MST heuristic · Maxwell pre-filter
+  Dominated-edge pruning · Beam-width open-list cap
+  Geometry-sorted neighbours · Cached Euler buckling
+
+Controls (full list)
+--------------------
+  A    Anchor mode        L  Load mode        N  No-load node mode
+  M    Manual member      S  Settings panel
+  SPACE  Run A* solver    F  Cycle labels      R  Reset auto members
+  C    Clear all          Q / Esc  Quit
+  H / Home               Reset viewport
+  +  /  -                Zoom in / out
+  Wheel                  Zoom (centred on cursor)
+  Middle-drag            Pan
+  Right-click (no node)  Pan
+  Right-click (on node)  Remove node  ← unchanged
 
 Colour convention
 -----------------
-  BLUE   = Tension   (+ve force)
-  RED    = Compression (-ve force)
-  PURPLE = Buckled   (compression exceeds Euler P_cr / SF)
-  GREY   = Unloaded  (manual member, no solve yet)
+  BLUE   = Tension        RED    = Compression
+  PURPLE = Buckled        GREY   = Unloaded
+  WHITE diamond = No-load intermediate node
 """
 
 import pygame
 import numpy as np
-import math, heapq, sys, time
+import math, heapq, sys, time, random
 from collections import deque
 
 # ── Window ─────────────────────────────────────────────────────────────────────
-WIDTH, HEIGHT  = 1100, 720
-PANEL_H        = 100
+WIDTH, HEIGHT  = 1200, 740
+PANEL_H        = 110
 SETTINGS_W     = 310
-NODE_SNAP      = 22
+NODE_SNAP      = 22          # world-space snap radius (scales with zoom for feel)
+
+# ── Viewport defaults ──────────────────────────────────────────────────────────
+DEFAULT_ZOOM   = 1.0
+MIN_ZOOM       = 0.15
+MAX_ZOOM       = 6.0
+ZOOM_STEP      = 1.15        # multiplicative step per wheel tick / key press
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 BG           = (10,  12,  20)
@@ -71,6 +77,7 @@ WHITE        = (228, 238, 255)
 DIM          = ( 80, 100, 135)
 ANCHOR_COL   = (255,  65,  65)
 LOAD_COL     = ( 50, 215, 135)
+NOLOAD_COL   = (160, 175, 220)
 
 MBR_TENSION  = ( 40, 140, 255)
 MBR_COMPRESS = (220,  55,  55)
@@ -95,17 +102,127 @@ DIAL_RING    = ( 55,  70, 110)
 DIAL_NEEDLE  = ( 50, 215, 135)
 DIAL_TEXT    = (220, 235, 255)
 
-BUCKLE_FLASH = (255, 140,   0)   # orange banner for buckled-preview
+BTN_BG       = ( 28,  38,  65)
+BTN_HOV      = ( 45,  60, 100)
+BTN_ACT      = ( 55, 150, 255)
 
-# ── Search limits ──────────────────────────────────────────────────────────────
-MAX_STATES   = 120_000
-MAX_DEGREE   = 4
-LABEL_CYCLE  = ["both", "force", "length", "sizing", "none"]
-
-DEFAULT_LOAD_ANGLE = 90.0   # straight down in pygame coords
-
-# How long (seconds) to show the buckled solution before continuing
+# ── Search / physics limits ────────────────────────────────────────────────────
+MAX_STATES         = 1_200_000
+MAX_DEGREE         = 4
+BEAM_WIDTH         = 8_000
+LABEL_CYCLE        = ["both", "force", "length", "sizing", "none"]
+DEFAULT_LOAD_ANGLE = 90.0
 BUCKLE_PREVIEW_SEC = 1.8
+MIN_LOAD_N         = 1.0
+MAX_LOAD_N         = 9999.0
+
+# ── Zobrist hashing ────────────────────────────────────────────────────────────
+_ZOB_SEED = 0xDEADBEEF_CAFEF00D
+random.seed(_ZOB_SEED)
+
+def _zobrist_for(edge):
+    a, b = (edge[0], edge[1]) if edge[0] < edge[1] else (edge[1], edge[0])
+    h = hash((a, b)) & 0xFFFF_FFFF_FFFF_FFFF
+    h ^= (h >> 30) * 0xBF58476D1CE4E5B9 & 0xFFFF_FFFF_FFFF_FFFF
+    h ^= (h >> 27) * 0x94D049BB133111EB & 0xFFFF_FFFF_FFFF_FFFF
+    h ^=  h >> 31
+    return h & 0xFFFF_FFFF_FFFF_FFFF
+
+_zob_cache: dict = {}
+
+def zob(edge):
+    key = (edge[0], edge[1]) if edge[0] <= edge[1] else (edge[1], edge[0])
+    v = _zob_cache.get(key)
+    if v is None:
+        v = _zobrist_for(key)
+        _zob_cache[key] = v
+    return v
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VIEWPORT  (world ↔ screen transform)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Viewport:
+    """
+    Manages pan + zoom.  All stored node data is in world space.
+    Screen space is what pygame draws to.
+    """
+    def __init__(self):
+        self.zoom  = DEFAULT_ZOOM
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._panning     = False   # middle or right-drag pan
+        self._pan_last    = (0, 0)
+        self._pan_origin  = (0, 0)
+
+    # ── transforms ────────────────────────────────────────────────────────────
+    def w2s(self, wx, wy):
+        """World → screen (float)."""
+        return wx * self.zoom + self.pan_x, wy * self.zoom + self.pan_y
+
+    def s2w(self, sx, sy):
+        """Screen → world (float)."""
+        return (sx - self.pan_x) / self.zoom, (sy - self.pan_y) / self.zoom
+
+    def w2si(self, wx, wy):
+        """World → screen (int tuple, for pygame draw calls)."""
+        x, y = self.w2s(wx, wy)
+        return int(x), int(y)
+
+    # ── zoom ──────────────────────────────────────────────────────────────────
+    def zoom_at(self, screen_x, screen_y, factor):
+        """Zoom by `factor`, keeping the point (screen_x, screen_y) stationary."""
+        new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self.zoom * factor))
+        if new_zoom == self.zoom:
+            return
+        # Adjust pan so the world point under the cursor stays fixed
+        wx, wy   = self.s2w(screen_x, screen_y)
+        self.zoom = new_zoom
+        self.pan_x = screen_x - wx * self.zoom
+        self.pan_y = screen_y - wy * self.zoom
+
+    def zoom_step(self, direction, cx=None, cy=None):
+        """direction: +1 zoom in, -1 zoom out. cx/cy default to canvas centre."""
+        if cx is None: cx = (WIDTH - (SETTINGS_W if False else 0)) // 2
+        if cy is None: cy = (HEIGHT - PANEL_H) // 2
+        self.zoom_at(cx, cy, ZOOM_STEP ** direction)
+
+    # ── reset ─────────────────────────────────────────────────────────────────
+    def reset(self):
+        self.zoom  = DEFAULT_ZOOM
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+
+    # ── pan events ────────────────────────────────────────────────────────────
+    def start_pan(self, sx, sy):
+        self._panning    = True
+        self._pan_last   = (sx, sy)
+
+    def update_pan(self, sx, sy):
+        if not self._panning:
+            return
+        dx = sx - self._pan_last[0]
+        dy = sy - self._pan_last[1]
+        self.pan_x += dx
+        self.pan_y += dy
+        self._pan_last = (sx, sy)
+
+    def stop_pan(self):
+        self._panning = False
+
+    @property
+    def is_panning(self):
+        return self._panning
+
+    # ── snap radius in world space (so it feels consistent at any zoom) ────────
+    def snap_radius_world(self):
+        return NODE_SNAP / self.zoom
+
+    # ── canvas clip rect (excludes settings panel and status bar) ─────────────
+    def canvas_rect(self, settings_open):
+        x0 = SETTINGS_W if settings_open else 0
+        return pygame.Rect(x0, 0, WIDTH - x0, HEIGHT - PANEL_H)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -122,6 +239,7 @@ class Params:
         self.K_factor      = 1.0
         self.safety_factor = 1.5
         self.pixels_per_m  = 200.0
+        self._pcr_cache: dict = {}
 
     @property
     def outer_r(self):  return self.outer_r_mm * 1e-3
@@ -129,7 +247,6 @@ class Params:
     def inner_r(self):  return max(0.0, self.outer_r - self.wall_mm * 1e-3)
     @property
     def t_r_ratio(self):
-        """wall-thickness / outer-radius ratio — preserved in per-member sizing."""
         if self.outer_r < 1e-12: return 0.2
         return min(0.5, self.wall_mm * 1e-3 / self.outer_r)
     @property
@@ -140,8 +257,6 @@ class Params:
     def E_pa(self):     return self.E * 1e9
     @property
     def T_MAX(self):    return self.yield_mpa * 1e6 * self.area
-
-    # NOTE: L_MAX_PX is kept for display / info only — NOT used to prune A*
     @property
     def L_MAX_PX(self):
         p_cr_min = self.T_MAX / self.safety_factor
@@ -149,15 +264,25 @@ class Params:
         L_m = (math.pi / self.K_factor) * math.sqrt(self.E_pa * self.I / p_cr_min)
         return L_m * self.pixels_per_m
 
-    def euler_pcr(self, length_px):
-        Lm = length_px / self.pixels_per_m
-        if Lm < 1e-9: return float("inf")
-        return (math.pi**2 * self.E_pa * self.I) / (self.K_factor * Lm)**2
+    def euler_pcr(self, length_px: float) -> float:
+        key = round(length_px * 2) / 2
+        v = self._pcr_cache.get(key)
+        if v is None:
+            Lm = key / self.pixels_per_m
+            if Lm < 1e-9:
+                v = float("inf")
+            else:
+                v = (math.pi**2 * self.E_pa * self.I) / (self.K_factor * Lm)**2
+            self._pcr_cache[key] = v
+        return v
+
+    def invalidate_cache(self):
+        self._pcr_cache.clear()
 
     def summary(self):
         return (f"E={self.E:.0f}GPa  sy={self.yield_mpa:.0f}MPa  "
                 f"OD={self.outer_r_mm*2:.1f}mm  t={self.wall_mm:.1f}mm  "
-                f"A={self.area*1e6:.2f}mm²  T_MAX={self.T_MAX:.1f}N")
+                f"T_MAX={self.T_MAX:.1f}N")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -165,61 +290,41 @@ class Params:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def min_section_for_force(force_N, length_px, p):
-    """
-    Given a scalar axial force |force_N| and member length, find the
-    minimum hollow circular cross-section (outer radius r_o, wall t = k*r_o)
-    that satisfies BOTH:
-      (a) Yield:    |F| <= sigma_y * A(r_o)          → A >= |F|/sigma_y
-      (b) Buckling: |F| <= P_cr(r_o,L) / SF          → I >= |F|*SF*(KL)²/π²E
-          (only if force is compressive)
+    abs_f = abs(force_N)
+    sy    = p.yield_mpa * 1e6
+    E_pa  = p.E_pa
+    K     = p.K_factor
+    SF    = p.safety_factor
+    k     = p.t_r_ratio
+    Lm    = length_px / p.pixels_per_m
 
-    Wall thickness is kept at the same t/r ratio as the global section.
-    Returns dict with r_o_mm, t_mm, area_mm2, volume_cm3, dominated_by.
-    """
-    abs_f  = abs(force_N)
-    sy     = p.yield_mpa * 1e6
-    E_pa   = p.E_pa
-    K      = p.K_factor
-    SF     = p.safety_factor
-    k      = p.t_r_ratio          # t/r_o
-    Lm     = length_px / p.pixels_per_m
+    A_min   = abs_f / sy if sy > 0 else 0.0
+    r_yield = math.sqrt(A_min / (math.pi * (1 - (1-k)**2))) if A_min > 0 else 0.0
 
-    # --- (a) yield constraint: A = pi*(r_o^2 - r_i^2) = pi*r_o^2*(1-(1-k)^2) >= F/sy
-    A_min  = abs_f / sy if sy > 0 else 0.0
-    r_yield = math.sqrt(A_min / (math.pi * (1 - (1 - k)**2))) if A_min > 0 else 0.0
-
-    # --- (b) buckling constraint (compression only)
     r_buckle = 0.0
     if force_N < 0 and Lm > 1e-9:
-        # P_cr = pi^2*E*I / (K*L)^2  and  I = pi/4 * r_o^4 * (1-(1-k)^4)
-        # Require P_cr/SF >= |F|  =>  I >= |F|*SF*(K*L)^2 / (pi^2*E)
         I_min    = abs_f * SF * (K * Lm)**2 / (math.pi**2 * E_pa)
-        coeff    = math.pi / 4 * (1 - (1 - k)**4)
+        coeff    = math.pi / 4 * (1 - (1-k)**4)
         r_buckle = (I_min / coeff) ** 0.25 if coeff > 0 else 0.0
 
-    r_o = max(r_yield, r_buckle, 1e-4)   # at least 0.1 mm
+    r_o = max(r_yield, r_buckle, 1e-4)
     t   = k * r_o
     r_i = r_o - t
     A   = math.pi * (r_o**2 - r_i**2)
-    vol = A * Lm * 1e6   # cm³  (A in m², L in m → m³ → ×1e6 cm³)
+    vol = A * Lm * 1e6
 
-    dominated = "buckling" if r_buckle >= r_yield else "yield"
     return {
         "r_o_mm":     r_o * 1e3,
         "t_mm":       t   * 1e3,
         "area_mm2":   A   * 1e6,
         "volume_cm3": vol,
-        "dominated":  dominated,
+        "dominated":  "buckling" if r_buckle >= r_yield else "yield",
     }
 
-
 def compute_member_sizing(members, forces, p):
-    """Returns dict: member -> sizing-dict from min_section_for_force."""
     sizing = {}
     for mem in members:
-        f = forces.get(mem, forces.get((mem[1], mem[0]), None))
-        if f is None:
-            f = 0.0
+        f    = forces.get(mem, forces.get((mem[1], mem[0]), 0.0)) or 0.0
         L_px = math.dist(*mem)
         sizing[mem] = min_section_for_force(f, L_px, p)
     return sizing
@@ -239,12 +344,11 @@ class Slider:
 
     def _to_t(self, v):
         if self.log:
-            return ((math.log(v)-math.log(self.lo)) /
-                    (math.log(self.hi)-math.log(self.lo)))
+            return (math.log(v)-math.log(self.lo)) / (math.log(self.hi)-math.log(self.lo))
         return (v-self.lo)/(self.hi-self.lo)
 
     def _from_t(self, t):
-        t = max(0.0,min(1.0,t))
+        t = max(0.0, min(1.0, t))
         if self.log:
             return math.exp(math.log(self.lo)+t*(math.log(self.hi)-math.log(self.lo)))
         return self.lo+t*(self.hi-self.lo)
@@ -258,20 +362,22 @@ class Slider:
         ty = y+18
         pygame.draw.rect(surf, SLIDER_TRACK, pygame.Rect(x, ty, w, self.H), border_radius=3)
         fw = int(t*w)
-        if fw>0: pygame.draw.rect(surf, SLIDER_FILL, pygame.Rect(x, ty, fw, self.H), border_radius=3)
-        kx=x+int(t*w); ky=ty+self.H//2
+        if fw > 0: pygame.draw.rect(surf, SLIDER_FILL, pygame.Rect(x, ty, fw, self.H), border_radius=3)
+        kx = x+int(t*w); ky = ty+self.H//2
         pygame.draw.circle(surf, SLIDER_KNOB, (kx, ky), self.KNOB_R)
         pygame.draw.circle(surf, SLIDER_FILL,  (kx, ky), self.KNOB_R, 2)
-        self.rect = pygame.Rect(x-self.KNOB_R, ty-self.KNOB_R, w+self.KNOB_R*2, self.H+self.KNOB_R*2)
+        self.rect = pygame.Rect(x-self.KNOB_R, ty-self.KNOB_R,
+                                w+self.KNOB_R*2, self.H+self.KNOB_R*2)
         return y+38
 
     def handle_event(self, event, p):
-        if event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
-            if self.rect.collidepoint(event.pos): self.dragging=True
-        if event.type==pygame.MOUSEBUTTONUP and event.button==1: self.dragging=False
-        if event.type==pygame.MOUSEMOTION and self.dragging:
-            rx=self.rect.x+self.KNOB_R; rw=self.rect.w-self.KNOB_R*2
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.rect.collidepoint(event.pos): self.dragging = True
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1: self.dragging = False
+        if event.type == pygame.MOUSEMOTION and self.dragging:
+            rx = self.rect.x+self.KNOB_R; rw = self.rect.w-self.KNOB_R*2
             setattr(p, self.attr, self._from_t((event.pos[0]-rx)/rw))
+            p.invalidate_cache()
             return True
         return False
 
@@ -283,7 +389,7 @@ class SettingsPanel:
     def __init__(self):
         self.open = False; self._anim_x = -SETTINGS_W
         self.groups = [
-            ("LOAD",  [Slider("Applied load per node","N","applied_load",10,2000,".0f")]),
+            ("DEFAULT LOAD", [Slider("Default load (new nodes)","N","applied_load",10,2000,".0f")]),
             ("MATERIAL", [
                 Slider("Young's modulus E","GPa","E",10,400,".0f"),
                 Slider("Yield strength sy","MPa","yield_mpa",50,1000,".0f"),
@@ -303,104 +409,185 @@ class SettingsPanel:
     def update_anim(self):
         target = 0 if self.open else -SETTINGS_W
         self._anim_x += (target-self._anim_x)*0.18
-        if abs(self._anim_x-target)<0.5: self._anim_x=target
+        if abs(self._anim_x-target) < 0.5: self._anim_x = target
 
     def draw(self, surf, fonts, p):
         self.update_anim()
-        ox=int(self._anim_x)
-        if ox<=-SETTINGS_W: return
-        sw=SETTINGS_W; sh=HEIGHT-PANEL_H
-        ps=pygame.Surface((sw,sh),pygame.SRCALPHA); ps.fill((*SETTINGS_BG,240))
-        surf.blit(ps,(ox,0))
-        pygame.draw.line(surf,DIVIDER,(ox+sw,0),(ox+sw,sh),1)
-        font_sm,font_md,font_tiny=fonts
-        py=self.PAD
-        hs=pygame.Surface((sw,36),pygame.SRCALPHA); hs.fill((*SETTINGS_HDR,255))
-        surf.blit(hs,(ox,py-self.PAD))
-        surf.blit(font_md.render("  PARAMETERS",True,HIGHLIGHT),(ox+self.PAD,py))
-        py+=36
-        surf.blit(font_tiny.render("Changes apply on next SPACE solve",True,DIM),(ox+self.PAD,py))
-        py+=20
-        iw=sw-self.PAD*2
-        for gname,sliders in self.groups:
-            pygame.draw.line(surf,DIVIDER,(ox,py+4),(ox+sw,py+4),1)
-            gh=font_tiny.render(gname,True,(100,120,160))
-            pygame.draw.rect(surf,TAG_BG,pygame.Rect(ox+self.PAD-2,py-1,gh.get_width()+8,gh.get_height()+4),border_radius=3)
-            surf.blit(gh,(ox+self.PAD+2,py)); py+=20
-            for sl in sliders: py=sl.draw(surf,font_sm,font_tiny,p,ox+self.PAD,py,iw)
-            py+=6
-        pygame.draw.line(surf,DIVIDER,(ox,py),(ox+sw,py),1); py+=8
+        ox = int(self._anim_x)
+        if ox <= -SETTINGS_W: return
+        sw = SETTINGS_W; sh = HEIGHT-PANEL_H
+        ps = pygame.Surface((sw,sh), pygame.SRCALPHA); ps.fill((*SETTINGS_BG,240))
+        surf.blit(ps, (ox,0))
+        pygame.draw.line(surf, DIVIDER, (ox+sw,0), (ox+sw,sh), 1)
+        font_sm, font_md, font_tiny = fonts
+        py = self.PAD
+        hs = pygame.Surface((sw,36), pygame.SRCALPHA); hs.fill((*SETTINGS_HDR,255))
+        surf.blit(hs, (ox,py-self.PAD))
+        surf.blit(font_md.render("  PARAMETERS", True, HIGHLIGHT), (ox+self.PAD,py))
+        py += 36
+        surf.blit(font_tiny.render("Changes apply on next SPACE solve", True, DIM), (ox+self.PAD,py))
+        py += 20
+        iw = sw-self.PAD*2
+        for gname, sliders in self.groups:
+            pygame.draw.line(surf, DIVIDER, (ox,py+4), (ox+sw,py+4), 1)
+            gh = font_tiny.render(gname, True, (100,120,160))
+            pygame.draw.rect(surf, TAG_BG, pygame.Rect(ox+self.PAD-2,py-1,
+                                                        gh.get_width()+8,gh.get_height()+4),
+                             border_radius=3)
+            surf.blit(gh, (ox+self.PAD+2,py)); py += 20
+            for sl in sliders: py = sl.draw(surf, font_sm, font_tiny, p, ox+self.PAD, py, iw)
+            py += 6
+        pygame.draw.line(surf, DIVIDER, (ox,py), (ox+sw,py), 1); py += 8
         for line in [
-            f"Area   = {p.area*1e6:.3f} mm²",
-            f"I      = {p.I*1e12:.4f} mm⁴",
-            f"T_MAX  = {p.T_MAX:.1f} N",
-            f"L_ref  = {p.L_MAX_PX/p.pixels_per_m*100:.1f} cm  (info only)",
+            f"Area  = {p.area*1e6:.3f} mm²",
+            f"I     = {p.I*1e12:.4f} mm⁴",
+            f"T_MAX = {p.T_MAX:.1f} N",
+            f"L_ref = {p.L_MAX_PX/p.pixels_per_m*100:.1f} cm",
         ]:
-            surf.blit(font_tiny.render(line,True,(130,155,195)),(ox+self.PAD,py)); py+=15
-        py+=6
-        pygame.draw.line(surf,DIVIDER,(ox,py),(ox+sw,py),1); py+=8
-        surf.blit(font_tiny.render("NOTE: L_max no longer limits A* search",True,(180,120,60)),(ox+self.PAD,py)); py+=14
-        surf.blit(font_tiny.render("Buckling checked post-solve",True,(180,120,60)),(ox+self.PAD,py)); py+=20
-        pygame.draw.line(surf,DIVIDER,(ox,py),(ox+sw,py),1); py+=8
-        surf.blit(font_tiny.render("COLOUR KEY",True,(100,120,160)),(ox+self.PAD,py)); py+=14
-        for col,lbl in [
-            (MBR_TENSION, "BLUE   = Tension (+ve)"),
-            (MBR_COMPRESS,"RED    = Compression (-ve)"),
-            (MBR_BUCKLE,  "PURPLE = Buckled"),
-            (MBR_UNLOADED,"GREY   = Unloaded"),
+            surf.blit(font_tiny.render(line, True, (130,155,195)), (ox+self.PAD,py)); py += 15
+        py += 4
+        pygame.draw.line(surf, DIVIDER, (ox,py), (ox+sw,py), 1); py += 8
+        surf.blit(font_tiny.render("Buckling checked post-solve", True, (180,120,60)), (ox+self.PAD,py)); py += 14
+        surf.blit(font_tiny.render("L_max does NOT limit A* search", True, (180,120,60)), (ox+self.PAD,py)); py += 18
+        pygame.draw.line(surf, DIVIDER, (ox,py), (ox+sw,py), 1); py += 8
+        surf.blit(font_tiny.render("COLOUR KEY", True, (100,120,160)), (ox+self.PAD,py)); py += 14
+        for col, lbl in [
+            (MBR_TENSION,  "BLUE   = Tension (+ve)"),
+            (MBR_COMPRESS, "RED    = Compression (-ve)"),
+            (MBR_BUCKLE,   "PURPLE = Buckled"),
+            (MBR_UNLOADED, "GREY   = Unloaded"),
+            (NOLOAD_COL,   "DIAMOND= No-load node"),
         ]:
-            pygame.draw.rect(surf,col,pygame.Rect(ox+self.PAD,py+2,10,10))
-            surf.blit(font_tiny.render(lbl,True,(160,175,210)),(ox+self.PAD+14,py)); py+=14
+            pygame.draw.rect(surf, col, pygame.Rect(ox+self.PAD,py+2,10,10))
+            surf.blit(font_tiny.render(lbl, True, (160,175,210)), (ox+self.PAD+14,py)); py += 14
 
     def handle_event(self, event, p):
-        changed=False
-        for _,sliders in self.groups:
+        changed = False
+        for _, sliders in self.groups:
             for sl in sliders:
-                if sl.handle_event(event,p): changed=True
+                if sl.handle_event(event, p): changed = True
         return changed
 
     def any_active(self):
-        for _,sliders in self.groups:
+        for _, sliders in self.groups:
             for sl in sliders:
                 if sl.is_active(): return True
         return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ANGLE DIAL
+# LOAD NODE EDITOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-def draw_angle_dial(surf, node_pos, angle_deg, font_tiny, font_sm):
-    nx,ny=node_pos; R=30; CX=nx+58; CY=ny
-    if CX+R+65>WIDTH: CX=nx-58
-    if CY-R-26<0: CY=ny+62
-    if CY+R+36>HEIGHT-PANEL_H: CY=ny-62
-    bg=pygame.Surface((R*2+6,R*2+6),pygame.SRCALPHA)
-    pygame.draw.circle(bg,(12,18,40,215),(R+3,R+3),R+3)
-    surf.blit(bg,(CX-R-3,CY-R-3))
-    pygame.draw.circle(surf,DIAL_RING,(CX,CY),R,2)
-    for tick_deg in range(0,360,30):
-        tr=math.radians(tick_deg); is_major=(tick_deg%90==0)
-        inner=R-(8 if is_major else 4)
-        tx1=int(CX+math.cos(tr)*inner); ty1=int(CY+math.sin(tr)*inner)
-        tx2=int(CX+math.cos(tr)*R);    ty2=int(CY+math.sin(tr)*R)
-        col=(150,170,210) if is_major else (55,70,105)
-        pygame.draw.line(surf,col,(tx1,ty1),(tx2,ty2),2 if is_major else 1)
-    for label,deg in [("E",0),("S",90),("W",180),("N",270)]:
-        lr=math.radians(deg)
-        lx=int(CX+math.cos(lr)*(R-13)); ly=int(CY+math.sin(lr)*(R-13))
-        ls=font_tiny.render(label,True,(100,125,170))
-        surf.blit(ls,(lx-ls.get_width()//2,ly-ls.get_height()//2))
-    ar=math.radians(angle_deg)
-    ex=int(CX+math.cos(ar)*(R-5)); ey=int(CY+math.sin(ar)*(R-5))
-    pygame.draw.line(surf,DIAL_NEEDLE,(CX,CY),(ex,ey),2)
-    pygame.draw.circle(surf,DIAL_NEEDLE,(ex,ey),4)
-    pygame.draw.circle(surf,BG,(CX,CY),3)
-    ds=font_sm.render(f"{angle_deg%360:.0f} deg",True,DIAL_TEXT)
-    surf.blit(ds,(CX-ds.get_width()//2,CY+R+5))
-    hint=font_tiny.render("<> +/-1  ^v +/-15  scroll +/-5",True,DIM)
-    surf.blit(hint,(CX-hint.get_width()//2,CY+R+21))
-    pygame.draw.line(surf,(45,60,95),node_pos,(CX,CY),1)
+class LoadEditor:
+    BTN_W  = 28
+    BTN_H  = 20
+    DIAL_R = 30
+
+    def __init__(self):
+        self._btn_minus     = pygame.Rect(0,0,0,0)
+        self._btn_plus      = pygame.Rect(0,0,0,0)
+        self._btn_minus_big = pygame.Rect(0,0,0,0)
+        self._btn_plus_big  = pygame.Rect(0,0,0,0)
+        self._hover_minus     = False
+        self._hover_plus      = False
+        self._hover_minus_big = False
+        self._hover_plus_big  = False
+
+    def draw(self, surf, node_screen_pos, angle_deg, magnitude, font_tiny, font_sm, mp):
+        """node_screen_pos is already in screen space."""
+        nx, ny = node_screen_pos
+        R  = self.DIAL_R
+        CX = nx + 70
+        CY = ny
+
+        if CX + R + 120 > WIDTH:           CX = nx - 70
+        if CY - R - 50  < 0:              CY = R + 50
+        if CY + R + 80  > HEIGHT-PANEL_H: CY = HEIGHT - PANEL_H - R - 80
+
+        bg = pygame.Surface((R*2+6, R*2+6), pygame.SRCALPHA)
+        pygame.draw.circle(bg, (12,18,40,220), (R+3,R+3), R+3)
+        surf.blit(bg, (CX-R-3, CY-R-3))
+        pygame.draw.circle(surf, DIAL_RING, (CX,CY), R, 2)
+
+        for tick_deg in range(0, 360, 30):
+            tr = math.radians(tick_deg); is_major = (tick_deg % 90 == 0)
+            inner = R - (8 if is_major else 4)
+            pygame.draw.line(surf,
+                (150,170,210) if is_major else (55,70,105),
+                (int(CX+math.cos(tr)*inner), int(CY+math.sin(tr)*inner)),
+                (int(CX+math.cos(tr)*R),     int(CY+math.sin(tr)*R)),
+                2 if is_major else 1)
+
+        for label, deg in [("E",0),("S",90),("W",180),("N",270)]:
+            lr = math.radians(deg)
+            lx = int(CX+math.cos(lr)*(R-13)); ly = int(CY+math.sin(lr)*(R-13))
+            ls = font_tiny.render(label, True, (100,125,170))
+            surf.blit(ls, (lx-ls.get_width()//2, ly-ls.get_height()//2))
+
+        ar = math.radians(angle_deg)
+        ex = int(CX+math.cos(ar)*(R-5)); ey = int(CY+math.sin(ar)*(R-5))
+        pygame.draw.line(surf, DIAL_NEEDLE, (CX,CY), (ex,ey), 2)
+        pygame.draw.circle(surf, DIAL_NEEDLE, (ex,ey), 4)
+        pygame.draw.circle(surf, BG, (CX,CY), 3)
+
+        ds = font_sm.render(f"{angle_deg%360:.0f}°", True, DIAL_TEXT)
+        surf.blit(ds, (CX-ds.get_width()//2, CY+R+4))
+        pygame.draw.line(surf, (45,60,95), node_screen_pos, (CX,CY), 1)
+
+        ex_y  = CY + R + 22
+        ex_cx = CX
+        mag_str = f"{magnitude:.0f} N"
+        ms = font_sm.render(mag_str, True, LOAD_COL)
+        BW = self.BTN_W; BH = self.BTN_H
+        total_w = BW + 6 + ms.get_width() + 6 + BW
+        start_x = ex_cx - total_w // 2
+        row_y   = ex_y + 14
+
+        self._btn_minus = pygame.Rect(start_x, row_y, BW, BH)
+        self._btn_plus  = pygame.Rect(start_x + BW+6+ms.get_width()+6, row_y, BW, BH)
+        self._hover_minus = self._btn_minus.collidepoint(mp)
+        self._hover_plus  = self._btn_plus.collidepoint(mp)
+
+        for rect, lbl, hov in [
+            (self._btn_minus, "-10", self._hover_minus),
+            (self._btn_plus,  "+10", self._hover_plus),
+        ]:
+            pygame.draw.rect(surf, BTN_HOV if hov else BTN_BG, rect, border_radius=4)
+            pygame.draw.rect(surf, (60,80,130), rect, 1, border_radius=4)
+            ls2 = font_tiny.render(lbl, True, WHITE)
+            surf.blit(ls2, (rect.x+rect.w//2-ls2.get_width()//2,
+                            rect.y+rect.h//2-ls2.get_height()//2))
+
+        surf.blit(ms, (start_x+BW+6, row_y+BH//2-ms.get_height()//2))
+
+        row_y2 = row_y + BH + 4
+        BW2 = 38
+        sx2 = ex_cx - (BW2*2+6) // 2
+        self._btn_minus_big = pygame.Rect(sx2,       row_y2, BW2, BH)
+        self._btn_plus_big  = pygame.Rect(sx2+BW2+6, row_y2, BW2, BH)
+        self._hover_minus_big = self._btn_minus_big.collidepoint(mp)
+        self._hover_plus_big  = self._btn_plus_big.collidepoint(mp)
+
+        for rect, lbl, hov in [
+            (self._btn_minus_big, "-100", self._hover_minus_big),
+            (self._btn_plus_big,  "+100", self._hover_plus_big),
+        ]:
+            pygame.draw.rect(surf, BTN_HOV if hov else BTN_BG, rect, border_radius=4)
+            pygame.draw.rect(surf, (60,80,130), rect, 1, border_radius=4)
+            ls3 = font_tiny.render(lbl, True, (200,210,240))
+            surf.blit(ls3, (rect.x+rect.w//2-ls3.get_width()//2,
+                            rect.y+rect.h//2-ls3.get_height()//2))
+
+        hint = font_tiny.render("[/] ±10  {/} ±100  scroll ±10  <>^v angle", True, DIM)
+        surf.blit(hint, (ex_cx-hint.get_width()//2, row_y2+BH+4))
+
+    def handle_click(self, pos):
+        if self._btn_minus.collidepoint(pos):     return -10.0
+        if self._btn_plus.collidepoint(pos):       return  10.0
+        if self._btn_minus_big.collidepoint(pos): return -100.0
+        if self._btn_plus_big.collidepoint(pos):   return  100.0
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -408,435 +595,565 @@ def draw_angle_dial(surf, node_pos, angle_deg, font_tiny, font_sm):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_graph(members):
-    g={}
-    for (a,b) in members:
-        g.setdefault(a,set()).add(b); g.setdefault(b,set()).add(a)
+    g = {}
+    for (a, b) in members:
+        g.setdefault(a, set()).add(b)
+        g.setdefault(b, set()).add(a)
     return g
 
 def node_degrees(members):
-    deg={}
-    for (a,b) in members:
-        deg[a]=deg.get(a,0)+1; deg[b]=deg.get(b,0)+1
+    deg = {}
+    for (a, b) in members:
+        deg[a] = deg.get(a, 0) + 1
+        deg[b] = deg.get(b, 0) + 1
     return deg
 
 def is_connected(members, anchors, loads):
     if not loads or not anchors: return False
-    g=build_graph(members); anchor_set=set(anchors)
+    g = build_graph(members)
+    anchor_set = set(anchors)
     for load in loads:
         if load not in g: return False
-        visited,q,found={load},deque([load]),False
+        visited, q, found = {load}, deque([load]), False
         while q:
-            cur=q.popleft()
-            if cur in anchor_set: found=True; break
-            for nb in g.get(cur,()):
+            cur = q.popleft()
+            if cur in anchor_set: found = True; break
+            for nb in g.get(cur, ()):
                 if nb not in visited: visited.add(nb); q.append(nb)
         if not found: return False
     return True
 
-def dijkstra_dist(graph, start, targets):
-    if start in targets: return 0.0
-    dist={start:0.0}; heap=[(0.0,start)]
+def steiner_lower_bound(members_list, required_nodes, anchors):
+    if not required_nodes or not anchors:
+        return 0.0
+    graph: dict = {}
+    for (a, b) in members_list:
+        d = math.dist(a, b)
+        graph.setdefault(a, {})[b] = d
+        graph.setdefault(b, {})[a] = d
+
+    dist = {}
+    heap = []
+    for a in anchors:
+        dist[a] = 0.0
+        heapq.heappush(heap, (0.0, a))
+
     while heap:
-        d,u=heapq.heappop(heap)
-        if u in targets: return d
-        if d>dist.get(u,float("inf")): continue
-        for v in graph.get(u,()):
-            nd=d+math.dist(u,v)
-            if nd<dist.get(v,float("inf")):
-                dist[v]=nd; heapq.heappush(heap,(nd,v))
-    return float("inf")
+        d, u = heapq.heappop(heap)
+        if d > dist.get(u, float("inf")): continue
+        for v, w in graph.get(u, {}).items():
+            nd = d + w
+            if nd < dist.get(v, float("inf")):
+                dist[v] = nd
+                heapq.heappush(heap, (nd, v))
+
+    h = 0.0
+    for nd in required_nodes:
+        if dist.get(nd, float("inf")) < float("inf"):
+            continue
+        h += min(math.dist(nd, a) for a in anchors)
+    return h
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHYSICS SOLVER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def solve_truss(members, anchors, loads, p, load_angles):
-    """
-    Method of joints.  Returns (ok, forces, buckled_set).
-    ok=True only when statically determinate, within yield, and no buckling.
-    Forces dict uses the member tuples as keys (as passed in).
-    """
+def maxwell_check(members, anchors, node_set):
+    m = len(members); r = len(anchors) * 2; j = len(node_set)
+    diff = m + r - 2 * j
+    if diff == 0:  return 'ok'
+    if diff > 0:   return 'over'
+    return 'under'
+
+def solve_truss(members, anchors, loads, p, load_angles, load_magnitudes):
     if not members: return False, {}, set()
-    node_set=set(anchors)|set(loads)
-    for a,b in members: node_set.add(a); node_set.add(b)
-    nodes=list(node_set); nidx={n:i for i,n in enumerate(nodes)}
-    j,m,r=len(nodes),len(members),len(anchors)*2
-    A=np.zeros((2*j,m+r)); b_vec=np.zeros(2*j)
-    for ci,(n1,n2) in enumerate(members):
-        i1,i2=nidx[n1],nidx[n2]
-        dx,dy=n2[0]-n1[0],n2[1]-n1[1]; L=math.hypot(dx,dy)
-        if L<1e-9: return False,{},set()
-        cx,cy=dx/L,dy/L
-        A[2*i1,ci]=-cx; A[2*i1+1,ci]=-cy
-        A[2*i2,ci]= cx; A[2*i2+1,ci]= cy
-    rc=m
+    node_set = set(anchors) | set(loads)
+    for a, b in members: node_set.add(a); node_set.add(b)
+    if maxwell_check(members, anchors, node_set) == 'under':
+        return False, {}, set()
+
+    nodes = list(node_set); nidx = {n: i for i, n in enumerate(nodes)}
+    j, m, r = len(nodes), len(members), len(anchors) * 2
+    A = np.zeros((2*j, m+r)); b_vec = np.zeros(2*j)
+
+    for ci, (n1, n2) in enumerate(members):
+        i1, i2 = nidx[n1], nidx[n2]
+        dx, dy = n2[0]-n1[0], n2[1]-n1[1]; L = math.hypot(dx, dy)
+        if L < 1e-9: return False, {}, set()
+        cx, cy = dx/L, dy/L
+        A[2*i1, ci] = -cx; A[2*i1+1, ci] = -cy
+        A[2*i2, ci] =  cx; A[2*i2+1, ci] =  cy
+
+    rc = m
     for anc in anchors:
-        idx=nidx[anc]; A[2*idx,rc]=1.0; A[2*idx+1,rc+1]=1.0; rc+=2
+        idx = nidx[anc]; A[2*idx, rc] = 1.0; A[2*idx+1, rc+1] = 1.0; rc += 2
+
     for ld in loads:
-        angle_deg=load_angles.get(ld,DEFAULT_LOAD_ANGLE)
-        ar=math.radians(angle_deg)
-        idx=nidx[ld]
-        b_vec[2*idx  ]+=p.applied_load*math.cos(ar)
-        b_vec[2*idx+1]+=p.applied_load*math.sin(ar)
+        angle_deg = load_angles.get(ld, DEFAULT_LOAD_ANGLE)
+        mag       = load_magnitudes.get(ld, p.applied_load)
+        ar        = math.radians(angle_deg)
+        idx       = nidx[ld]
+        b_vec[2*idx  ] += mag * math.cos(ar)
+        b_vec[2*idx+1] += mag * math.sin(ar)
+
     try:
-        x,_,rank,_=np.linalg.lstsq(A,b_vec,rcond=None)
-        if rank<min(A.shape): return False,{},set()
-        if np.linalg.norm(A@x-b_vec)>1e-3: return False,{},set()
-        forces={members[i]:float(x[i]) for i in range(m)}
-        if max(abs(f) for f in forces.values())>p.T_MAX:
-            return False,forces,set()   # yield exceeded — return forces for display
-        buckled=set()
-        for mem,f in forces.items():
-            if f<0:
-                pcr=p.euler_pcr(math.dist(*mem))/p.safety_factor
-                if abs(f)>pcr: buckled.add(mem)
-        return len(buckled)==0, forces, buckled
+        x, _, rank, _ = np.linalg.lstsq(A, b_vec, rcond=None)
+        if rank < min(A.shape): return False, {}, set()
+        if np.linalg.norm(A @ x - b_vec) > 1e-3: return False, {}, set()
+        forces = {members[i]: float(x[i]) for i in range(m)}
+        if max(abs(f) for f in forces.values()) > p.T_MAX:
+            return False, forces, set()
+        buckled = set()
+        for mem, f in forces.items():
+            if f < 0:
+                pcr = p.euler_pcr(math.dist(*mem)) / p.safety_factor
+                if abs(f) > pcr: buckled.add(mem)
+        return len(buckled) == 0, forces, buckled
     except Exception:
-        return False,{},set()
+        return False, {}, set()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# A* SEARCH  (no L_max pruning — buckling handled post-solve)
+# OPTIMIZED A* SEARCH
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _total_length(members):
-    return sum(math.dist(a,b) for a,b in members)
+class TrussStateV4:
+    __slots__ = ("members_fs","member_hash","frontier_fs","g","h","f","n_members")
 
-def _heuristic(members_iter, loads, anchors):
-    ml = list(members_iter)
-    graph = build_graph(ml)
-    anchor_set = set(anchors)
-    h = 0.0
-    
-    for load in loads:
-        # 1. Find the entire connected structure branching from this specific load
-        visited = {load}
-        q = deque([load])
-        reached_anchor = False
-        
-        while q:
-            cur = q.popleft()
-            if cur in anchor_set:
-                reached_anchor = True
-                break
-            for nb in graph.get(cur, ()):
-                if nb not in visited:
-                    visited.add(nb)
-                    q.append(nb)
-                    
-        # 2. If this part of the structure has reached the ground, it needs 0 more steel
-        if reached_anchor:
-            continue
-            
-        # 3. THE FIX: If not connected yet, find the shortest "gap" from ANY node
-        # we have built so far (the frontier) to ANY ground anchor. 
-        min_gap = min(math.dist(n, a) for n in visited for a in anchor_set)
-        h += min_gap
-        
-    return h
+    def __init__(self, members_fs, member_hash, frontier_fs, g, anchors_fs, required_fs):
+        self.members_fs  = members_fs
+        self.member_hash = member_hash
+        self.frontier_fs = frontier_fs
+        self.n_members   = len(members_fs)
+        self.g = g
+        self.h = steiner_lower_bound(members_fs, required_fs, anchors_fs)
+        self.f = g + self.h
 
-class TrussState:
-    __slots__=("members","frontier","g","h","f")
-    def __init__(self,members,frontier,anchors_fs,loads_fs):
-        self.members=members; self.frontier=frontier
-        self.g=_total_length(members)
-        self.h=_heuristic(members,loads_fs,anchors_fs)
-        self.f=self.g+self.h
-    def __lt__(self,other): return self.f<other.f
+    def __lt__(self, other): return self.f < other.f
 
 
-def run_astar(anchors, loads, p, load_angles, fixed_members=None,
-              blacklist=None, status_callback=None):
-    """
-    A* search.  No L_max pruning — members of any length are explored.
-    blacklist: set of frozensets of member-sets to skip (previously buckled solutions).
-    Returns (members, forces, buckled_set, log, best_g).
-    """
-    anchors_fs=frozenset(anchors); loads_fs=frozenset(loads)
-    all_nodes=list(anchors_fs|loads_fs)
-    fixed=list(fixed_members) if fixed_members else []
-    fixed_fs=frozenset(fixed)
-    bl=set(blacklist) if blacklist else set()
+def _edge_key(a, b):
+    return (a, b) if a <= b else (b, a)
 
-    start=TrussState(fixed_fs,frozenset(loads),anchors_fs,loads_fs)
-    heap=[(start.f,0,start)]
-    counter=0; explored={}
-    best=None; best_g=float("inf")
-    log=[f"A* search  Load={p.applied_load:.0f}N  E={p.E:.0f}GPa  "
-         f"T_MAX={p.T_MAX:.1f}N  (no L_max prune)"]
+def run_astar(anchors, loads, noloads, p, load_angles, load_magnitudes,
+              fixed_members=None, blacklist=None):
+    anchors_fs  = frozenset(anchors)
+    loads_fs    = frozenset(loads)
+    required_fs = loads_fs | frozenset(noloads)
+    all_nodes   = list(anchors_fs | required_fs)
+
+    fixed       = list(fixed_members) if fixed_members else []
+    fixed_fs    = frozenset(map(lambda m: _edge_key(*m), fixed))
+    bl          = set(blacklist) if blacklist else set()
+
+    log = [f"A* v4 | {len(loads)} load, {len(noloads)} no-load, {len(anchors)} anchor"]
+
+    if not anchors or not loads:
+        log.append("  ✗ Need anchors and load nodes.")
+        return list(fixed_fs), {}, set(), log, float("inf")
+
+    init_hash = 0
+    for edge in fixed_fs: init_hash ^= zob(edge)
+
+    def node_priority(n):
+        return min((math.dist(n, r) for r in required_fs), default=0.0)
+    all_nodes_sorted = sorted(all_nodes, key=node_priority)
+
+    start = TrussStateV4(fixed_fs, init_hash, required_fs,
+                         sum(math.dist(*e) for e in fixed_fs),
+                         anchors_fs, required_fs)
+    heap    = [(start.f, 0, start)]
+    counter = 0
+    explored: dict = {}
+    best         = None
+    best_g       = float("inf")
+    states_tried = 0
 
     while heap:
-        _,_,cur=heapq.heappop(heap)
-        prev_g=explored.get(cur.members,float("inf"))
-        if cur.g>=prev_g: continue
-        explored[cur.members]=cur.g
-        if cur.g>=best_g: continue
+        _, _, cur = heapq.heappop(heap)
+        states_tried += 1
 
-        if is_connected(list(cur.members),anchors_fs,loads_fs):
-            # Skip blacklisted topologies
-            if cur.members in bl:
-                pass
-            else:
-                ok,forces,buckled=solve_truss(
-                    list(cur.members),anchors_fs,loads_fs,p,load_angles)
-                if forces:   # statically solved (may or may not buckle)
-                    if ok and cur.g<best_g:
-                        best_g=cur.g
-                        best=(cur.g,cur.members,forces,buckled)
-                        log.append(f"  ✓ {len(cur.members)} members, "
-                                   f"{cur.g/p.pixels_per_m*100:.1f}cm  [s={counter}]")
-                        continue
-                    elif not ok and buckled and cur.g<best_g:
-                        # Yield-failed — skip; buckled but geometrically valid — return for preview
-                        if len(buckled)>0:
-                            # This is a "buckled candidate" — return it so caller can show it
-                            log.append(f"  ⚠ Buckled candidate {len(cur.members)} members "
-                                       f"[s={counter}]")
-                            return list(cur.members),forces,buckled,log,cur.g
+        vis_key = (cur.member_hash, cur.n_members)
+        prev_g  = explored.get(vis_key, float("inf"))
+        if cur.g >= prev_g: continue
+        explored[vis_key] = cur.g
+        if cur.g >= best_g: continue
 
-        deg=node_degrees(list(cur.members)); special=anchors_fs|loads_fs
-        for fn in cur.frontier:
-            for other in all_nodes:
-                if other==fn: continue
-                pair=(fn,other); pair_r=(other,fn)
-                if pair in cur.members or pair_r in cur.members: continue
-                # No L_max check here — any length is allowed
-                if fn    not in special and deg.get(fn,   0)>=MAX_DEGREE: continue
-                if other not in special and deg.get(other,0)>=MAX_DEGREE: continue
-                new_members=cur.members|{pair}
-                new_g=cur.g+math.dist(fn,other)
-                if new_g>=best_g: continue
-                if new_g>=explored.get(new_members,float("inf")): continue
-                ns=TrussState(new_members,cur.frontier|{other},anchors_fs,loads_fs)
-                if ns.f<best_g:
-                    counter+=1; heapq.heappush(heap,(ns.f,counter,ns))
+        if is_connected(list(cur.members_fs), anchors_fs, required_fs):
+            cand_key = frozenset(_edge_key(*e) for e in cur.members_fs)
+            if cand_key not in bl:
+                node_set = set(anchors)
+                for a, b in cur.members_fs: node_set.add(a); node_set.add(b)
+                node_set.update(loads)
+                if maxwell_check(list(cur.members_fs), anchors_fs, node_set) != 'under':
+                    ok, forces, buckled = solve_truss(
+                        list(cur.members_fs), anchors_fs, loads_fs, p,
+                        load_angles, load_magnitudes)
+                    if forces:
+                        if ok and cur.g < best_g:
+                            best_g = cur.g
+                            best   = (cur.g, cur.members_fs, forces, buckled)
+                            log.append(f"  ✓ {len(cur.members_fs)} mbr  "
+                                       f"{cur.g/p.pixels_per_m*100:.1f}cm")
+                            continue
+                        elif not ok and buckled and cur.g < best_g:
+                            log.append(f"  ⚠ buckled {len(cur.members_fs)} mbr")
+                            return list(cur.members_fs), forces, buckled, log, cur.g
 
-        if counter>=MAX_STATES:
-            log.append(f"  ! State cap ({MAX_STATES}) reached."); break
+        deg     = node_degrees(list(cur.members_fs))
+        special = anchors_fs | required_fs
+
+        g_cur   = build_graph(list(cur.members_fs))
+        reachable = set(anchors_fs)
+        bfs_q = deque(anchors_fs)
+        while bfs_q:
+            u = bfs_q.popleft()
+            for v in g_cur.get(u, ()):
+                if v not in reachable: reachable.add(v); bfs_q.append(v)
+
+        for fn in cur.frontier_fs:
+            if fn not in special and deg.get(fn, 0) >= MAX_DEGREE: continue
+            for other in all_nodes_sorted:
+                if other == fn: continue
+                ek = _edge_key(fn, other)
+                if ek in cur.members_fs: continue
+                if other not in special and deg.get(other, 0) >= MAX_DEGREE: continue
+                if fn in reachable and other in reachable:
+                    if fn not in required_fs and other not in required_fs: continue
+                new_g = cur.g + math.dist(fn, other)
+                if new_g >= best_g: continue
+                new_hash = cur.member_hash ^ zob(ek)
+                new_n    = cur.n_members + 1
+                if new_g >= explored.get((new_hash, new_n), float("inf")): continue
+                ns = TrussStateV4(cur.members_fs | {ek}, new_hash,
+                                  cur.frontier_fs | {other}, new_g,
+                                  anchors_fs, required_fs)
+                if ns.f < best_g:
+                    counter += 1
+                    heapq.heappush(heap, (ns.f, counter, ns))
+
+        if len(heap) > BEAM_WIDTH * 4:
+            heap = heapq.nsmallest(BEAM_WIDTH, heap)
+            heapq.heapify(heap)
+
+        if states_tried >= MAX_STATES:
+            log.append(f"  ! State cap reached."); break
 
     if best:
-        _,mfs,forces,buckled=best
-        log.append(f"  * Optimal: {best_g/p.pixels_per_m*100:.1f}cm, {len(mfs)} members.")
-        return list(mfs),forces,buckled,log,best_g
+        _, mfs, forces, buckled = best
+        log.append(f"  * Optimal: {best_g/p.pixels_per_m*100:.1f}cm, "
+                   f"{len(mfs)} members. States: {states_tried}")
+        return list(mfs), forces, buckled, log, best_g
     else:
-        log.append("  ✗ No valid truss found.")
-        return list(fixed_fs),{},set(),log,float("inf")
+        log.append(f"  ✗ No valid truss. States: {states_tried}")
+        return list(fixed_fs), {}, set(), log, float("inf")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DRAWING HELPERS
+# DRAWING HELPERS  (all world-space coords; vp = Viewport passed in)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def lerp_col(c1,c2,t):
-    t=max(0.0,min(1.0,t))
+def lerp_col(c1, c2, t):
+    t = max(0.0, min(1.0, t))
     return tuple(int(c1[i]+(c2[i]-c1[i])*t) for i in range(3))
 
-def draw_canvas_area(surf, settings_open):
-    sp=40; x0=SETTINGS_W if settings_open else 0
-    for x in range(x0,WIDTH,sp): pygame.draw.line(surf,GRID_COL,(x,0),(x,HEIGHT-PANEL_H))
-    for y in range(0,HEIGHT-PANEL_H,sp): pygame.draw.line(surf,GRID_COL,(x0,y),(WIDTH,y))
+def draw_canvas_area(surf, vp: Viewport, settings_open):
+    """Draw grid lines in screen space, respecting pan/zoom."""
+    sp     = 40  # world-space grid spacing
+    x0_px  = SETTINGS_W if settings_open else 0
+    # Grid step in screen space
+    sp_s   = sp * vp.zoom
+    if sp_s < 6: return   # too dense to draw
 
-def draw_member_line(surf, a, b, force=None, max_force=1.0,
+    # Starting world coord just left/above screen
+    wx_start = (x0_px - vp.pan_x) / vp.zoom
+    wy_start = (0     - vp.pan_y) / vp.zoom
+    wx_end   = (WIDTH  - vp.pan_x) / vp.zoom
+    wy_end   = ((HEIGHT - PANEL_H) - vp.pan_y) / vp.zoom
+
+    # Snap to grid
+    wx0 = math.floor(wx_start / sp) * sp
+    wy0 = math.floor(wy_start / sp) * sp
+
+    wx = wx0
+    while wx <= wx_end:
+        sx, _ = vp.w2s(wx, 0)
+        if sx >= x0_px:
+            pygame.draw.line(surf, GRID_COL, (int(sx), 0), (int(sx), HEIGHT-PANEL_H))
+        wx += sp
+
+    wy = wy0
+    while wy <= wy_end:
+        _, sy = vp.w2s(0, wy)
+        if 0 <= sy <= HEIGHT-PANEL_H:
+            pygame.draw.line(surf, GRID_COL, (x0_px, int(sy)), (WIDTH, int(sy)))
+        wy += sp
+
+
+def draw_member_line(surf, vp: Viewport, a, b, force=None, max_force=1.0,
                      manual=False, buckled=False,
-                     label_mode="both", font_tiny=None, p=None,
-                     sizing=None):
-    L_px=math.dist(a,b)
-    pcr=(p.euler_pcr(L_px)/p.safety_factor) if p else float("inf")
+                     label_mode="both", font_tiny=None, p=None, sizing=None):
+    sa = vp.w2si(*a)
+    sb = vp.w2si(*b)
+    L_px = math.dist(a, b)
+    pcr  = (p.euler_pcr(L_px) / p.safety_factor) if p else float("inf")
 
     if buckled:
-        color,w=MBR_BUCKLE,4
-    elif force is not None and max_force>1e-9:
-        t=min(1.0,abs(force)/max_force)
-        if force>0:
-            color=lerp_col((20,60,140),MBR_TENSION,0.4+0.6*t)
+        color, w = MBR_BUCKLE, max(2, int(4 * vp.zoom))
+    elif force is not None and max_force > 1e-9:
+        t = min(1.0, abs(force)/max_force)
+        if force > 0:
+            color = lerp_col((20,60,140), MBR_TENSION, 0.4+0.6*t)
         else:
-            t_b=min(1.0,abs(force)/pcr) if pcr<float("inf") else 0.0
-            base=lerp_col((80,20,20),MBR_COMPRESS,0.4+0.6*t)
-            color=lerp_col(base,MBR_BUCKLE,t_b*0.45)
-        w=max(2,int(2+4*t))
+            t_b = min(1.0, abs(force)/pcr) if pcr < float("inf") else 0.0
+            base = lerp_col((80,20,20), MBR_COMPRESS, 0.4+0.6*t)
+            color = lerp_col(base, MBR_BUCKLE, t_b*0.45)
+        w = max(2, int((2+4*t) * max(0.5, min(2.0, vp.zoom))))
     else:
-        color,w=MBR_UNLOADED,2
+        color, w = MBR_UNLOADED, max(1, int(2 * max(0.5, min(2.0, vp.zoom))))
 
-    pygame.draw.line(surf,color,(int(a[0]),int(a[1])),(int(b[0]),int(b[1])),w)
-    pygame.draw.circle(surf,WHITE,(int(a[0]),int(a[1])),4)
-    pygame.draw.circle(surf,WHITE,(int(b[0]),int(b[1])),4)
+    pygame.draw.line(surf, color, sa, sb, w)
+    nr = max(2, int(4 * max(0.4, min(2.0, vp.zoom))))
+    pygame.draw.circle(surf, WHITE, sa, nr)
+    pygame.draw.circle(surf, WHITE, sb, nr)
 
-    if label_mode!="none" and font_tiny:
-        mid=((a[0]+b[0])/2,(a[1]+b[1])/2)
-        dx=b[0]-a[0]; dy=b[1]-a[1]; Lv=math.hypot(dx,dy) or 1
-        ox=int(mid[0]+(-dy/Lv)*14); oy=int(mid[1]+(dx/Lv)*14)
-        rows=[]
+    # Labels — only draw when zoom is large enough to be readable
+    if label_mode != "none" and font_tiny and vp.zoom >= 0.5:
+        mid_w = ((a[0]+b[0])/2, (a[1]+b[1])/2)
+        mid_s = vp.w2s(*mid_w)
+        dx = b[0]-a[0]; dy = b[1]-a[1]; Lv = math.hypot(dx,dy) or 1
+        offset = 14
+        ox2 = int(mid_s[0]+(-dy/Lv)*offset)
+        oy2 = int(mid_s[1]+( dx/Lv)*offset)
+        rows = []
         if label_mode in ("length","both"):
-            cm=L_px/(p.pixels_per_m if p else 200)*100
-            rows.append((f"{cm:.1f}cm",lerp_col(DIM,WHITE,0.55)))
+            cm = L_px/(p.pixels_per_m if p else 200)*100
+            rows.append((f"{cm:.1f}cm", lerp_col(DIM,WHITE,0.55)))
         if label_mode in ("force","both") and force is not None:
-            kind="T" if force>0 else "C"
-            fcol=MBR_BUCKLE if buckled else (MBR_TENSION if force>0 else MBR_COMPRESS)
-            rows.append((f"{abs(force):.1f}N {kind}",fcol))
-        if label_mode=="sizing" and sizing is not None:
-            # Show per-member minimum section
-            dom_col=(MBR_COMPRESS if sizing["dominated"]=="buckling" else MBR_TENSION)
+            kind = "T" if force > 0 else "C"
+            fcol = MBR_BUCKLE if buckled else (MBR_TENSION if force > 0 else MBR_COMPRESS)
+            rows.append((f"{abs(force):.1f}N {kind}", fcol))
+        if label_mode == "sizing" and sizing is not None:
+            dom_col = MBR_COMPRESS if sizing["dominated"]=="buckling" else MBR_TENSION
             rows.append((f"r={sizing['r_o_mm']:.1f}mm t={sizing['t_mm']:.1f}mm", dom_col))
             rows.append((f"V={sizing['volume_cm3']:.3f}cm³", (180,190,210)))
-        for li,(txt,col) in enumerate(rows):
-            s=font_tiny.render(txt,True,col)
-            lx=ox-s.get_width()//2; ly=oy-s.get_height()//2+li*13
-            pad=2
-            bg=pygame.Surface((s.get_width()+pad*2,s.get_height()+pad*2),pygame.SRCALPHA)
-            bg.fill((8,10,18,185)); surf.blit(bg,(lx-pad,ly-pad)); surf.blit(s,(lx,ly))
+        for li, (txt, col) in enumerate(rows):
+            s = font_tiny.render(txt, True, col)
+            lx = ox2-s.get_width()//2; ly = oy2-s.get_height()//2+li*13
+            pad = 2
+            bg2 = pygame.Surface((s.get_width()+pad*2, s.get_height()+pad*2), pygame.SRCALPHA)
+            bg2.fill((8,10,18,185)); surf.blit(bg2, (lx-pad,ly-pad)); surf.blit(s, (lx,ly))
 
     if buckled:
-        mid2=((a[0]+b[0])//2,(a[1]+b[1])//2)
-        dx=b[0]-a[0]; dy=b[1]-a[1]; Lv=math.hypot(dx,dy) or 1
-        perp=(-dy/Lv*9,dx/Lv*9)
-        pts=[a,(mid2[0]+perp[0],mid2[1]+perp[1]),
-             (mid2[0]-perp[0],mid2[1]-perp[1]),b]
-        pygame.draw.lines(surf,MBR_BUCKLE,False,[(int(q[0]),int(q[1])) for q in pts],2)
+        mid2 = vp.w2si((a[0]+b[0])/2, (a[1]+b[1])/2)
+        dx = b[0]-a[0]; dy = b[1]-a[1]; Lv = math.hypot(dx,dy) or 1
+        perp = (-dy/Lv*9, dx/Lv*9)
+        sca = vp.w2s(*a); scb = vp.w2s(*b)
+        pts = [sca,
+               (mid2[0]+perp[0], mid2[1]+perp[1]),
+               (mid2[0]-perp[0], mid2[1]-perp[1]),
+               scb]
+        pygame.draw.lines(surf, MBR_BUCKLE, False,
+                          [(int(q[0]),int(q[1])) for q in pts], 2)
 
-def draw_node(surf, pos, kind, hover=False, selected=False):
-    x,y=pos; ring=SEL_COL if selected else (HOVER_COL if hover else WHITE)
-    if kind=="anchor":
-        s=13; pts=[(x,y-s),(x-s,y+s),(x+s,y+s)]
-        pygame.draw.polygon(surf,ANCHOR_COL,pts)
-        pygame.draw.polygon(surf,ring,pts,2)
-        for i in range(-2,4):
-            bx=x-s+i*6; pygame.draw.line(surf,ANCHOR_COL,(bx,y+s),(bx-6,y+s+7),2)
-    else:
-        pygame.draw.circle(surf,LOAD_COL,(x,y),10)
-        pygame.draw.circle(surf,ring,(x,y),10,2)
 
-def draw_load_arrow(surf, pos, angle_deg):
-    x,y=pos; ar=math.radians(angle_deg)
-    dx=math.cos(ar)*28; dy=math.sin(ar)*28
-    sx,sy=x-int(dx),y-int(dy)
-    pygame.draw.line(surf,LOAD_COL,(sx,sy),(x,y),3)
-    perp_x=-dy/28*6; perp_y=dx/28*6
-    pygame.draw.polygon(surf,LOAD_COL,[
-        (x,y),
-        (int(x-dx/28*10+perp_x),int(y-dy/28*10+perp_y)),
-        (int(x-dx/28*10-perp_x),int(y-dy/28*10-perp_y)),
-    ])
+def draw_node(surf, vp: Viewport, wpos, kind, hover=False, selected=False):
+    sx, sy = vp.w2si(*wpos)
+    ring = SEL_COL if selected else (HOVER_COL if hover else WHITE)
+    z = vp.zoom
 
-def draw_force_table(surf, fonts, members, forces, buckled_set, manual_indices, p,
-                     sizing_map=None):
+    if kind == "anchor":
+        s = max(7, int(13 * max(0.5, min(2.0, z))))
+        pts = [(sx, sy-s),(sx-s, sy+s),(sx+s, sy+s)]
+        pygame.draw.polygon(surf, ANCHOR_COL, pts)
+        pygame.draw.polygon(surf, ring, pts, 2)
+        step = max(3, int(6 * max(0.5, min(2.0, z))))
+        for i in range(-2, 4):
+            bx = sx-s+i*step
+            pygame.draw.line(surf, ANCHOR_COL, (bx, sy+s), (bx-step, sy+s+max(4,step)), 2)
+
+    elif kind == "load":
+        r = max(5, int(10 * max(0.5, min(2.0, z))))
+        pygame.draw.circle(surf, LOAD_COL, (sx,sy), r)
+        pygame.draw.circle(surf, ring, (sx,sy), r, 2)
+
+    elif kind == "noload":
+        s = max(5, int(10 * max(0.5, min(2.0, z))))
+        pts = [(sx, sy-s),(sx+s, sy),(sx, sy+s),(sx-s, sy)]
+        pygame.draw.polygon(surf, BG, pts)
+        pygame.draw.polygon(surf, NOLOAD_COL, pts, 2)
+        if selected or hover:
+            pygame.draw.polygon(surf, ring, pts, 2)
+
+
+def draw_load_arrow(surf, vp: Viewport, wpos, angle_deg, magnitude, p, font_tiny):
+    wx, wy = wpos
+    scale  = max(0.5, min(2.5, magnitude / max(p.applied_load, 1.0)))
+    length = int(20 + 16 * scale)  # world-space length
+    ar = math.radians(angle_deg)
+    dx = math.cos(ar)*length; dy = math.sin(ar)*length
+    # tail and tip in world space
+    tail_w = (wx-dx, wy-dy)
+    tip_w  = (wx,    wy   )
+    tail_s = vp.w2si(*tail_w)
+    tip_s  = vp.w2si(*tip_w)
+
+    col = lerp_col(LOAD_COL, (255,255,100), max(0.0,
+          min(1.0, magnitude/max(p.applied_load,1.0)*0.5+0.5) - 1.0))
+    pygame.draw.line(surf, col, tail_s, tip_s, max(1, int(3*max(0.5,min(2.0,vp.zoom)))))
+
+    # arrowhead
+    screen_len = math.dist(tail_s, tip_s)
+    if screen_len > 4:
+        ahlen = min(12, length)
+        norm_dx = dx/length; norm_dy = dy/length
+        perp_x  = -norm_dy * 6; perp_y = norm_dx * 6
+        p1 = vp.w2si(wx-norm_dx*ahlen + perp_x, wy-norm_dy*ahlen + perp_y)
+        p2 = vp.w2si(wx-norm_dx*ahlen - perp_x, wy-norm_dy*ahlen - perp_y)
+        pygame.draw.polygon(surf, col, [tip_s, p1, p2])
+
+    if font_tiny and vp.zoom >= 0.5:
+        ls = font_tiny.render(f"{magnitude:.0f}N", True, lerp_col(LOAD_COL,WHITE,0.4))
+        surf.blit(ls, (tail_s[0]-ls.get_width()//2-2, tail_s[1]-14))
+
+
+def draw_force_table(surf, fonts, members, forces, buckled_set,
+                     manual_indices, p, sizing_map=None):
     if not forces: return
-    font_sm,font_md,font_tiny=fonts
-    rows=[]
-    for i,(a,b) in enumerate(members):
-        f=forces.get((a,b),forces.get((b,a),None))
+    font_sm, font_md, font_tiny = fonts
+    rows = []
+    for i, (a, b) in enumerate(members):
+        f = forces.get((a,b), forces.get((b,a), None))
         if f is None: continue
-        L_px=math.dist(a,b); L_cm=L_px/p.pixels_per_m*100
-        bk=(a,b) in buckled_set or (b,a) in buckled_set
-        mn=i in manual_indices
-        sz=None
-        if sizing_map:
-            sz=sizing_map.get((a,b),sizing_map.get((b,a),None))
-        rows.append((abs(f),f,L_cm,bk,mn,i+1,sz))
-    rows.sort(key=lambda r:r[0],reverse=True)
+        L_px = math.dist(a, b); L_cm = L_px/p.pixels_per_m*100
+        bk   = (a,b) in buckled_set or (b,a) in buckled_set
+        mn   = i in manual_indices
+        sz   = (sizing_map.get((a,b), sizing_map.get((b,a),None))) if sizing_map else None
+        rows.append((abs(f), f, L_cm, bk, mn, i+1, sz))
+    rows.sort(key=lambda r: r[0], reverse=True)
 
-    PAD,ROW_H,BAR_W,COL_W=8,18,70,195
-    pw=COL_W+BAR_W+PAD*3
-    ph=min(PAD*2+22+len(rows)*ROW_H+22,HEIGHT-PANEL_H-20)
-    px=WIDTH-pw-8; py=8
+    PAD, ROW_H, BAR_W, COL_W = 8, 18, 70, 195
+    pw = COL_W + BAR_W + PAD*3
+    ph = min(PAD*2+22+len(rows)*ROW_H+22, HEIGHT-PANEL_H-20)
+    px = WIDTH-pw-8; py = 8
 
-    bg=pygame.Surface((pw,ph),pygame.SRCALPHA); bg.fill((12,15,28,215))
-    surf.blit(bg,(px,py))
-    pygame.draw.rect(surf,(45,55,85),(px,py,pw,ph),1)
-    surf.blit(font_sm.render("MEMBER FORCES",True,(175,192,222)),(px+PAD,py+PAD))
-    pygame.draw.line(surf,(40,52,82),(px,py+22+PAD),(px+pw,py+22+PAD),1)
+    bg = pygame.Surface((pw,ph), pygame.SRCALPHA); bg.fill((12,15,28,215))
+    surf.blit(bg, (px,py))
+    pygame.draw.rect(surf, (45,55,85), (px,py,pw,ph), 1)
+    surf.blit(font_sm.render("MEMBER FORCES", True, (175,192,222)), (px+PAD, py+PAD))
+    pygame.draw.line(surf, (40,52,82), (px,py+22+PAD), (px+pw,py+22+PAD), 1)
 
-    max_abs=max(r[0] for r in rows) if rows else 1.0
-    vis=(ph-22-PAD*2-22)//ROW_H
-    for ri,(abs_f,f,L_cm,bk,mn,midx,sz) in enumerate(rows[:vis]):
-        ry=py+24+PAD+ri*ROW_H
-        if ri%2==0:
-            rb=pygame.Surface((pw-2,ROW_H),pygame.SRCALPHA); rb.fill((255,255,255,7))
-            surf.blit(rb,(px+1,ry))
-        if bk:    tc,tcol="B!",MBR_BUCKLE
-        elif f>0: tc,tcol="T", MBR_TENSION
-        else:     tc,tcol="C", MBR_COMPRESS
-        if mn and not bk: tcol=lerp_col(tcol,(180,170,255),0.35)
-        surf.blit(font_tiny.render(f"#{midx:02d}",True,(110,130,160)),(px+PAD,ry+2))
-        surf.blit(font_tiny.render(tc,True,tcol),(px+PAD+28,ry+2))
-        surf.blit(font_tiny.render(f"{abs_f:6.1f}N",True,tcol),(px+PAD+42,ry+2))
-        surf.blit(font_tiny.render(f"{L_cm:5.1f}cm",True,(95,115,150)),(px+PAD+105,ry+2))
-        bx=px+COL_W+PAD; bm=BAR_W-4; bl=int(bm*abs_f/max_abs)
-        pygame.draw.rect(surf,(28,36,56),(bx,ry+4,bm,ROW_H-8))
-        if bl>0: pygame.draw.rect(surf,tcol,(bx,ry+4,bl,ROW_H-8))
-        # Show sizing hint in table if available
+    max_abs = max(r[0] for r in rows) if rows else 1.0
+    vis = (ph-22-PAD*2-22)//ROW_H
+    for ri, (abs_f, f, L_cm, bk, mn, midx, sz) in enumerate(rows[:vis]):
+        ry = py+24+PAD+ri*ROW_H
+        if ri % 2 == 0:
+            rb = pygame.Surface((pw-2,ROW_H), pygame.SRCALPHA); rb.fill((255,255,255,7))
+            surf.blit(rb, (px+1,ry))
+        if bk:    tc, tcol = "B!", MBR_BUCKLE
+        elif f>0: tc, tcol = "T",  MBR_TENSION
+        else:     tc, tcol = "C",  MBR_COMPRESS
+        if mn and not bk: tcol = lerp_col(tcol, (180,170,255), 0.35)
+        surf.blit(font_tiny.render(f"#{midx:02d}", True, (110,130,160)), (px+PAD,ry+2))
+        surf.blit(font_tiny.render(tc, True, tcol), (px+PAD+28,ry+2))
+        surf.blit(font_tiny.render(f"{abs_f:6.1f}N", True, tcol), (px+PAD+42,ry+2))
+        surf.blit(font_tiny.render(f"{L_cm:5.1f}cm", True, (95,115,150)), (px+PAD+105,ry+2))
         if sz:
-            hint=f"r{sz['r_o_mm']:.1f}mm V{sz['volume_cm3']:.2f}"
-            surf.blit(font_tiny.render(hint,True,(85,105,140)),(px+COL_W-60,ry+2))
-    if len(rows)>vis:
-        surf.blit(font_tiny.render(f"...{len(rows)-vis} more",True,DIM),(px+PAD,py+ph-16))
-    fy=py+ph-14
-    for txt,col,ox in [("T=tension",MBR_TENSION,PAD),
-                       ("C=compress",MBR_COMPRESS,70),
-                       ("B!=buckled",MBR_BUCKLE,138)]:
-        surf.blit(font_tiny.render(txt,True,col),(px+ox,fy))
+            surf.blit(font_tiny.render(f"r{sz['r_o_mm']:.1f}", True, (85,105,140)),
+                      (px+PAD+152,ry+2))
+        bx2 = px+COL_W+PAD; bm = BAR_W-4; bl2 = int(bm*abs_f/max_abs)
+        pygame.draw.rect(surf, (28,36,56), (bx2,ry+4,bm,ROW_H-8))
+        if bl2 > 0: pygame.draw.rect(surf, tcol, (bx2,ry+4,bl2,ROW_H-8))
+    if len(rows) > vis:
+        surf.blit(font_tiny.render(f"...{len(rows)-vis} more", True, DIM),
+                  (px+PAD, py+ph-16))
+    fy = py+ph-14
+    for txt, col, ox2 in [("T=tension",MBR_TENSION,PAD),
+                           ("C=compress",MBR_COMPRESS,70),
+                           ("B!=buckled",MBR_BUCKLE,138)]:
+        surf.blit(font_tiny.render(txt, True, col), (px+ox2, fy))
+
 
 def draw_stress_legend(surf, font_sm, font_tiny):
-    lx,ly=14,HEIGHT-PANEL_H-68
-    surf.blit(font_sm.render("tension",True,MBR_TENSION),(lx,ly-16))
-    surf.blit(font_sm.render("compression",True,MBR_COMPRESS),(lx+54,ly-16))
+    lx, ly = 14, HEIGHT-PANEL_H-68
+    surf.blit(font_sm.render("tension",     True, MBR_TENSION),  (lx,    ly-16))
+    surf.blit(font_sm.render("compression", True, MBR_COMPRESS), (lx+54, ly-16))
     for i in range(50):
-        c=lerp_col((20,60,140),MBR_TENSION,i/49)
-        pygame.draw.line(surf,c,(lx+i,ly),(lx+i,ly+8))
+        c = lerp_col((20,60,140), MBR_TENSION, i/49)
+        pygame.draw.line(surf, c, (lx+i,ly), (lx+i,ly+8))
     for i in range(50):
-        c=lerp_col((80,20,20),MBR_COMPRESS,i/49)
-        pygame.draw.line(surf,c,(lx+50+i,ly),(lx+50+i,ly+8))
-    pygame.draw.line(surf,MBR_BUCKLE,(lx,ly+18),(lx+100,ly+18),3)
-    surf.blit(font_sm.render("buckled",True,MBR_BUCKLE),(lx+4,ly+23))
+        c = lerp_col((80,20,20), MBR_COMPRESS, i/49)
+        pygame.draw.line(surf, c, (lx+50+i,ly), (lx+50+i,ly+8))
+    pygame.draw.line(surf, MBR_BUCKLE, (lx,ly+18), (lx+100,ly+18), 3)
+    surf.blit(font_sm.render("buckled", True, MBR_BUCKLE), (lx+4,ly+23))
 
-def draw_status_bar(surf, fonts, mode, status, solved, label_mode,
-                    n_members, total_len, p, sel_load, load_angles):
-    font_sm,font_md,font_tiny=fonts
-    bar=pygame.Surface((WIDTH,PANEL_H)); bar.fill(PANEL_COL)
-    surf.blit(bar,(0,HEIGHT-PANEL_H))
-    pygame.draw.line(surf,DIVIDER,(0,HEIGHT-PANEL_H),(WIDTH,HEIGHT-PANEL_H),2)
-    mc={"ANCHOR":ANCHOR_COL,"LOAD":LOAD_COL,"MANUAL":MBR_MANUAL}
-    ml={"ANCHOR":"ANCHOR [A]","LOAD":"LOAD [L]","MANUAL":"MANUAL [M]"}
-    len_str=(f"  |  {total_len/p.pixels_per_m*100:.1f}cm total"
-             if total_len<float("inf") else "")
-    mode_str=ml.get(mode,mode)
-    if mode=="LOAD" and sel_load is not None:
-        ang=load_angles.get(sel_load,DEFAULT_LOAD_ANGLE)%360
-        mode_str+=f"  (selected: {ang:.0f}°)"
-    lines=[
-        (f"MODE: {mode_str}",mc.get(mode,WHITE),(14,HEIGHT-PANEL_H+7)),
-        ("A  L  M  S=settings  SPACE=solve  F=labels  R=reset  C=clear  Q=quit",
-         DIM,(14,HEIGHT-PANEL_H+30)),
-        (status,HIGHLIGHT if solved else TEXT_COL,(14,HEIGHT-PANEL_H+53)),
-        (f"Load={p.applied_load:.0f}N  E={p.E:.0f}GPa  "
-         f"OD={p.outer_r_mm*2:.1f}mm  t={p.wall_mm:.1f}mm  "
-         f"T_MAX={p.T_MAX:.1f}N  SF={p.safety_factor:.1f}"
-         f"{len_str}  |  labels:{label_mode}",
-         DIM,(14,HEIGHT-PANEL_H+76)),
-    ]
-    if n_members:
-        lines.append((f"{n_members} members",WHITE,(WIDTH-140,HEIGHT-PANEL_H+7)))
-    for txt,col,pos in lines:
-        surf.blit(font_sm.render(txt,True,col),pos)
 
 def draw_buckle_banner(surf, fonts, n_buckled, attempt):
-    """Flashing orange banner shown during buckled-solution preview."""
-    font_sm,font_md,font_tiny=fonts
-    t=time.time()
-    alpha=int(200+55*math.sin(t*8))
-    banner=pygame.Surface((WIDTH,36),pygame.SRCALPHA)
-    banner.fill((180,60,0,min(255,alpha)))
-    surf.blit(banner,(0,0))
-    msg=(f"⚠  BUCKLED SOLUTION (attempt {attempt}) — "
-         f"{n_buckled} member(s) buckle  — searching for better topology…")
-    s=font_md.render(msg,True,(255,220,100))
-    surf.blit(s,(WIDTH//2-s.get_width()//2,8))
+    font_sm, font_md, font_tiny = fonts
+    alpha  = int(200+55*math.sin(time.time()*8))
+    banner = pygame.Surface((WIDTH,36), pygame.SRCALPHA)
+    banner.fill((180,60,0, min(255,alpha)))
+    surf.blit(banner, (0,0))
+    msg = (f"⚠  BUCKLED (attempt {attempt}) — "
+           f"{n_buckled} member(s) buckle — searching next topology…")
+    s = font_md.render(msg, True, (255,220,100))
+    surf.blit(s, (WIDTH//2-s.get_width()//2, 8))
 
-def nearest_node(pos, nodes, threshold=NODE_SNAP):
-    best,best_d=None,threshold
+
+def draw_zoom_indicator(surf, vp: Viewport, font_tiny):
+    """Small zoom % badge in the bottom-left of the canvas."""
+    if abs(vp.zoom - 1.0) < 0.01: return
+    txt = f"  {vp.zoom*100:.0f}%  "
+    s = font_tiny.render(txt, True, WHITE)
+    bx, by = 14, HEIGHT-PANEL_H-20
+    pygame.draw.rect(surf, (20,28,50,200), (bx-2, by-2, s.get_width()+4, s.get_height()+4),
+                     border_radius=3)
+    surf.blit(s, (bx, by))
+
+
+def draw_status_bar(surf, fonts, mode, status, solved, label_mode,
+                    n_members, total_len, p, sel_load, load_angles, load_magnitudes, vp):
+    font_sm, font_md, font_tiny = fonts
+    bar = pygame.Surface((WIDTH,PANEL_H)); bar.fill(PANEL_COL)
+    surf.blit(bar, (0,HEIGHT-PANEL_H))
+    pygame.draw.line(surf, DIVIDER, (0,HEIGHT-PANEL_H), (WIDTH,HEIGHT-PANEL_H), 2)
+    mc = {"ANCHOR":ANCHOR_COL,"LOAD":LOAD_COL,"MANUAL":MBR_MANUAL,"NOLOAD":NOLOAD_COL}
+    ml = {"ANCHOR":"ANCHOR [A]","LOAD":"LOAD [L]","MANUAL":"MANUAL [M]","NOLOAD":"NO-LOAD [N]"}
+    len_str = (f"  |  {total_len/p.pixels_per_m*100:.1f}cm" if total_len < float("inf") else "")
+    zoom_str = f"  zoom:{vp.zoom*100:.0f}%"
+    mode_str = ml.get(mode, mode)
+    if mode == "LOAD" and sel_load is not None:
+        ang = load_angles.get(sel_load, DEFAULT_LOAD_ANGLE) % 360
+        mag = load_magnitudes.get(sel_load, p.applied_load)
+        mode_str += f"  (sel: {ang:.0f}°  {mag:.0f}N)"
+    lines = [
+        (f"MODE: {mode_str}", mc.get(mode,WHITE), (14,HEIGHT-PANEL_H+6)),
+        ("A=anchor  L=load  N=no-load  M=manual  S=settings  SPACE=solve  F=labels  R=reset  C=clear  H=reset view  Q=quit",
+         DIM, (14,HEIGHT-PANEL_H+27)),
+        (status, HIGHLIGHT if solved else TEXT_COL, (14,HEIGHT-PANEL_H+50)),
+        (f"default={p.applied_load:.0f}N  E={p.E:.0f}GPa  "
+         f"OD={p.outer_r_mm*2:.1f}mm  t={p.wall_mm:.1f}mm  "
+         f"T_MAX={p.T_MAX:.1f}N  SF={p.safety_factor:.1f}{len_str}{zoom_str}  labels:{label_mode}",
+         DIM, (14,HEIGHT-PANEL_H+74)),
+        ("Wheel=zoom  Mid/Right-drag=pan  +/-=zoom  H=reset view  "
+         "In LOAD: [/]±10N  {/}±100N  Ctrl+scroll=angle",
+         (60,80,120), (14,HEIGHT-PANEL_H+92)),
+    ]
+    if n_members:
+        lines.append((f"{n_members} members", WHITE, (WIDTH-150,HEIGHT-PANEL_H+6)))
+    for txt, col, pos in lines:
+        surf.blit(font_sm.render(txt, True, col), pos)
+
+
+def nearest_node(screen_pos, nodes, vp: Viewport):
+    """Find closest node to a screen-space position, using world-space snap radius."""
+    wx, wy = vp.s2w(*screen_pos)
+    snap_r = vp.snap_radius_world()
+    best, best_d = None, snap_r
     for n in nodes:
-        d=math.dist(pos,n)
-        if d<best_d: best,best_d=n,d
+        d = math.dist((wx, wy), n)
+        if d < best_d: best, best_d = n, d
     return best
 
 
@@ -846,77 +1163,116 @@ def nearest_node(pos, nodes, threshold=NODE_SNAP):
 
 def main():
     pygame.init()
-    win=pygame.display.set_mode((WIDTH,HEIGHT))
-    pygame.display.set_caption("AI Truss Builder — A* + Live Parameters  v2")
-    clock=pygame.time.Clock()
+    win = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("AI Truss Builder v5 — zoom + pan")
+    clock = pygame.time.Clock()
     try:
-        font_sm  =pygame.font.SysFont("Consolas",15)
-        font_md  =pygame.font.SysFont("Consolas",17,bold=True)
-        font_tiny=pygame.font.SysFont("Consolas",11)
+        font_sm   = pygame.font.SysFont("Consolas", 15)
+        font_md   = pygame.font.SysFont("Consolas", 17, bold=True)
+        font_tiny = pygame.font.SysFont("Consolas", 11)
     except Exception:
-        font_sm  =pygame.font.SysFont(None,15)
-        font_md  =pygame.font.SysFont(None,17)
-        font_tiny=pygame.font.SysFont(None,11)
-    fonts=(font_sm,font_md,font_tiny)
+        font_sm   = pygame.font.SysFont(None, 15)
+        font_md   = pygame.font.SysFont(None, 17)
+        font_tiny = pygame.font.SysFont(None, 11)
+    fonts = (font_sm, font_md, font_tiny)
 
-    p=Params(); settings=SettingsPanel()
+    p        = Params()
+    settings = SettingsPanel()
+    editor   = LoadEditor()
+    vp       = Viewport()
 
-    anchors=[]; loads=[]; load_angles={}
-    members=[]; forces={}; buckled_set=set()
-    manual_indices=set()
-    member_sizing={}   # per-member minimum section after solve
+    # Node data — all in world space (same pixel units as v3/v4)
+    anchors         = []
+    loads           = []
+    noloads         = []
+    load_angles     = {}
+    load_magnitudes = {}
 
-    mode="ANCHOR"; status="Place anchors (A) and loads (L), then SPACE to solve."
-    solved=False; sel_node=None; sel_load=None
-    total_len=float("inf"); label_mode="both"
+    members        = []
+    forces         = {}
+    buckled_set    = set()
+    manual_indices = set()
+    member_sizing  = {}
 
-    # Buckle-preview state
-    preview_buckled=False       # are we currently showing a buckled solution?
-    preview_end_time=0.0        # when to stop showing it
-    preview_members=[]
-    preview_forces={}
-    preview_buckled_set=set()
-    buckle_attempt=0
+    mode       = "ANCHOR"
+    status     = "Place anchors [A], loads [L], no-load [N], then SPACE. Wheel=zoom, mid-drag=pan."
+    solved     = False
+    sel_node   = None   # MANUAL first-click (world coords)
+    sel_load   = None   # selected load node (world coords)
+    total_len  = float("inf")
+    label_mode = "both"
+
+    # Right-click pan state (separate from middle-button pan)
+    _rclick_pan     = False
+    _rclick_pan_pos = (0, 0)  # screen pos where right-click started
+    _rclick_moved   = False   # did the mouse move before release?
+
+    def all_placed_nodes():
+        return list(set(anchors) | set(loads) | set(noloads))
 
     def get_fixed():
         return [members[i] for i in sorted(manual_indices)]
 
-    def rotate_sel_load(delta_deg):
-        nonlocal forces,buckled_set,solved,total_len,member_sizing
-        if sel_load is None: return
-        load_angles[sel_load]=(load_angles.get(sel_load,DEFAULT_LOAD_ANGLE)+delta_deg)
+    def clamp_mag(v):
+        return max(MIN_LOAD_N, min(MAX_LOAD_N, v))
+
+    def change_magnitude(node, delta):
+        nonlocal forces, buckled_set, solved, total_len, member_sizing
+        if node is None: return
+        load_magnitudes[node] = clamp_mag(load_magnitudes.get(node, p.applied_load) + delta)
         forces.clear(); buckled_set.clear(); member_sizing.clear()
-        solved=False; total_len=float("inf")
+        solved = False; total_len = float("inf")
+
+    def rotate_angle(node, delta_deg):
+        nonlocal forces, buckled_set, solved, total_len, member_sizing
+        if node is None: return
+        load_angles[node] = load_angles.get(node, DEFAULT_LOAD_ANGLE) + delta_deg
+        forces.clear(); buckled_set.clear(); member_sizing.clear()
+        solved = False; total_len = float("inf")
+
+    def apply_result(src_members, src_forces, src_buckled, src_len, fixed):
+        nonlocal members, forces, buckled_set, manual_indices, total_len
+        members.clear(); forces.clear(); buckled_set.clear(); manual_indices.clear()
+        for mm in fixed:
+            manual_indices.add(len(members)); members.append(mm)
+        for m in src_members:
+            norm = tuple(sorted([m[0], m[1]]))
+            if not any(tuple(sorted([e[0],e[1]])) == norm for e in members):
+                members.append(m)
+        forces = {}
+        for m, f in src_forces.items():
+            if m in members: forces[m] = f
+            elif (m[1],m[0]) in members: forces[(m[1],m[0])] = f
+        buckled_set = set()
+        for m in src_buckled:
+            if m in members: buckled_set.add(m)
+            elif (m[1],m[0]) in members: buckled_set.add((m[1],m[0]))
+        total_len = src_len
 
     def do_solve():
-        """Run A* with post-solve buckling loop.  Updates global state."""
-        nonlocal members,forces,buckled_set,manual_indices,solved,total_len
-        nonlocal preview_buckled,preview_end_time,preview_members
-        nonlocal preview_forces,preview_buckled_set,buckle_attempt,member_sizing
-        nonlocal status
+        nonlocal solved, member_sizing, status
+        if len(anchors) < 1 or len(loads) < 1:
+            status = "Need >=1 anchor and >=1 load node."; return
 
-        if len(anchors)<1 or len(loads)<1:
-            status="Need >=1 anchor and >=1 load."; return
-
-        blacklist=set()
-        attempt=0
-        fixed=get_fixed()
+        p.invalidate_cache()
+        blacklist = set(); attempt = 0; fixed = get_fixed()
 
         while True:
-            attempt+=1
-            # Show "Solving…" splash
+            attempt += 1
             win.fill(BG)
-            win.blit(font_md.render(
-                f"A* Solving… (attempt {attempt})",True,HIGHLIGHT),
-                (WIDTH//2-90,HEIGHT//2-20))
-            win.blit(font_sm.render(p.summary(),True,DIM),
-                     (WIDTH//2-220,HEIGHT//2+10))
+            win.blit(font_md.render(f"A* Solving… attempt {attempt}", True, HIGHLIGHT),
+                     (WIDTH//2-120, HEIGHT//2-24))
+            win.blit(font_sm.render(p.summary(), True, DIM),
+                     (WIDTH//2-220, HEIGHT//2+10))
+            if noloads:
+                win.blit(font_sm.render(
+                    f"{len(noloads)} no-load node(s) as waypoints",
+                    True, NOLOAD_COL), (WIDTH//2-130, HEIGHT//2+30))
             if blacklist:
                 win.blit(font_sm.render(
-                    f"Blacklisted {len(blacklist)} buckled topology(s)",True,(200,120,60)),
-                    (WIDTH//2-160,HEIGHT//2+35))
-            pygame.display.flip()
-            pygame.event.pump()   # keep window responsive
+                    f"Blacklisted {len(blacklist)} buckled topology(s)",
+                    True, (200,120,60)), (WIDTH//2-150, HEIGHT//2+50))
+            pygame.display.flip(); pygame.event.pump()
 
             t_start = time.time()
 
@@ -924,265 +1280,367 @@ def main():
                 anchors, loads, noloads, p,
                 load_angles, load_magnitudes,
                 fixed_members=fixed, blacklist=blacklist)
-            t_end = time.time()
+            t_end = time.time()     # ← AND THIS LINE HERE
             print(f"Attempt {attempt} | Solve time: {t_end - t_start:.2f}s | "
                     f"Members: {len(new_m)} | Nodes: {len(anchors)} anchors, "
                     f"{len(loads)} loads")
 
             for line in log: print(line)
 
-            # Rebuild member list
-            def apply_result(src_members,src_forces,src_buckled,src_len):
-                nonlocal members,forces,buckled_set,manual_indices,total_len
-                members.clear(); forces.clear(); buckled_set.clear()
-                manual_indices.clear()
-                for mm in fixed:
-                    manual_indices.add(len(members)); members.append(mm)
-                for m in src_members:
-                    norm=tuple(sorted([m[0],m[1]]))
-                    if not any(tuple(sorted([e[0],e[1]]))==norm for e in members):
-                        members.append(m)
-                forces={}
-                for m,f in src_forces.items():
-                    if m in members: forces[m]=f
-                    elif (m[1],m[0]) in members: forces[(m[1],m[0])]=f
-                buckled_set=set()
-                for m in src_buckled:
-                    if m in members: buckled_set.add(m)
-                    elif (m[1],m[0]) in members: buckled_set.add((m[1],m[0]))
-                total_len=src_len
-
             if not new_f:
-                # No solution found at all
-                apply_result(new_m,new_f,new_b,opt_len)
-                solved=False; member_sizing={}
-                status="No valid truss — adjust parameters or add intermediate nodes."
+                apply_result(new_m, new_f, new_b, opt_len, fixed)
+                solved = False; member_sizing = {}
+                status = "No valid truss — add intermediate nodes or adjust parameters."
                 return
 
             if not new_b:
-                # Clean solution — done
-                apply_result(new_m,new_f,new_b,opt_len)
-                solved=True; member_sizing=compute_member_sizing(members,forces,p)
-                max_f=max(abs(f) for f in new_f.values()) if new_f else 0
-                pct=100*max_f/p.T_MAX
-                total_vol=sum(sz["volume_cm3"] for sz in member_sizing.values())
-                status=(f"OK  {opt_len/p.pixels_per_m*100:.1f}cm  "
-                        f"{len(members)} members  peak {pct:.0f}% T_MAX  "
-                        f"min-vol={total_vol:.3f}cm³")
+                apply_result(new_m, new_f, new_b, opt_len, fixed)
+                solved = True; member_sizing = compute_member_sizing(members, forces, p)
+                max_f  = max(abs(f) for f in new_f.values()) if new_f else 0
+                pct    = 100 * max_f / p.T_MAX
+                total_vol = sum(sz["volume_cm3"] for sz in member_sizing.values())
+                status = (f"OK  {opt_len/p.pixels_per_m*100:.1f}cm  "
+                          f"{len(members)} members  peak {pct:.0f}% T_MAX  "
+                          f"min-vol={total_vol:.3f}cm³")
                 return
             else:
-                # Buckled — show preview then continue
-                buckle_attempt=attempt
-                preview_members=list(new_m)
-                preview_forces=dict(new_f)
-                preview_buckled_set=set(new_b)
-                preview_buckled=True
-                preview_end_time=time.time()+BUCKLE_PREVIEW_SEC
+                apply_result(new_m, new_f, new_b, opt_len, fixed)
+                solved = False; n_b = len(new_b)
+                status = f"Attempt {attempt}: {n_b} member(s) buckle — re-searching…"
 
-                # Apply to main display while we wait
-                apply_result(new_m,new_f,new_b,opt_len)
-                solved=False
-                n_b=len(new_b)
-                status=(f"Attempt {attempt}: {n_b} member(s) buckle — "
-                        f"showing for {BUCKLE_PREVIEW_SEC:.1f}s then re-searching…")
-
-                # Render loop for the preview period
-                t_start=time.time()
-                while time.time()-t_start<BUCKLE_PREVIEW_SEC:
+                t_start = time.time()
+                while time.time()-t_start < BUCKLE_PREVIEW_SEC:
                     for ev in pygame.event.get():
-                        if ev.type==pygame.QUIT: pygame.quit(); sys.exit()
-                        if ev.type==pygame.KEYDOWN and ev.key in (pygame.K_q,pygame.K_ESCAPE):
+                        if ev.type == pygame.QUIT: pygame.quit(); sys.exit()
+                        if ev.type == pygame.KEYDOWN and ev.key in (pygame.K_q, pygame.K_ESCAPE):
                             pygame.quit(); sys.exit()
-                    win.fill(BG)
-                    draw_canvas_area(win,settings.open)
-                    max_fv=max((abs(f) for f in preview_forces.values()),default=1.0)
-                    for i,(a,b) in enumerate(members):
-                        f2=preview_forces.get((a,b),preview_forces.get((b,a),None))
-                        draw_member_line(win,a,b,force=f2,max_force=max_fv,
+                    win.fill(BG); draw_canvas_area(win, vp, settings.open)
+                    max_fv = max((abs(f) for f in forces.values()), default=1.0)
+                    for i, (a, b) in enumerate(members):
+                        f2 = forces.get((a,b), forces.get((b,a), None))
+                        draw_member_line(win, vp, a, b, force=f2, max_force=max_fv,
                                          manual=(i in manual_indices),
-                                         buckled=((a,b) in preview_buckled_set or
-                                                  (b,a) in preview_buckled_set),
-                                         label_mode=label_mode,font_tiny=font_tiny,p=p)
-                    for a in anchors: draw_node(win,a,"anchor")
+                                         buckled=((a,b) in buckled_set or (b,a) in buckled_set),
+                                         label_mode=label_mode, font_tiny=font_tiny, p=p)
+                    for a in anchors: draw_node(win, vp, a, "anchor")
                     for ld in loads:
-                        draw_node(win,ld,"load")
-                        draw_load_arrow(win,ld,load_angles.get(ld,DEFAULT_LOAD_ANGLE))
-                    draw_buckle_banner(win,fonts,n_b,attempt)
-                    draw_force_table(win,fonts,members,preview_forces,
-                                     preview_buckled_set,manual_indices,p)
-                    draw_stress_legend(win,font_sm,font_tiny)
-                    draw_status_bar(win,fonts,mode,status,False,label_mode,
-                                    len(members),opt_len,p,sel_load,load_angles)
-                    pygame.display.flip()
-                    clock.tick(60)
+                        draw_node(win, vp, ld, "load")
+                        draw_load_arrow(win, vp, ld,
+                                        load_angles.get(ld, DEFAULT_LOAD_ANGLE),
+                                        load_magnitudes.get(ld, p.applied_load),
+                                        p, font_tiny)
+                    for nl in noloads: draw_node(win, vp, nl, "noload")
+                    draw_buckle_banner(win, fonts, n_b, attempt)
+                    draw_force_table(win, fonts, members, forces, buckled_set, manual_indices, p)
+                    draw_stress_legend(win, font_sm, font_tiny)
+                    draw_status_bar(win, fonts, mode, status, False, label_mode,
+                                    len(members), opt_len, p, sel_load,
+                                    load_angles, load_magnitudes, vp)
+                    pygame.display.flip(); clock.tick(60)
 
-                preview_buckled=False
-                # Blacklist this member topology
                 blacklist.add(frozenset(tuple(sorted([m[0],m[1]])) for m in new_m))
+                if attempt >= 8:
+                    status = f"Gave up after {attempt} attempts. Adjust parameters or add nodes."
+                    member_sizing = {}; return
 
-                if attempt>=8:
-                    status=(f"Gave up after {attempt} attempts — "
-                            "all found topologies buckle. Try adjusting parameters.")
-                    member_sizing={}
-                    return
+    # ── canvas clip surface for scissoring ────────────────────────────────────
+    def canvas_x0():
+        return SETTINGS_W if (settings.open and settings._anim_x > -SETTINGS_W*0.5) else 0
 
-    running=True
+    # ── Main loop ──────────────────────────────────────────────────────────────
+    running = True
     while running:
-        mp=pygame.mouse.get_pos()
-        all_nodes=list(set(anchors)|set(loads))
-        hover_node=nearest_node(mp,all_nodes)
+        mp         = pygame.mouse.get_pos()
+        all_nodes  = all_placed_nodes()
+        hover_node = nearest_node(mp, all_nodes, vp)
+
+        # ── Are we over the canvas (not settings or status bar)? ──────────────
+        cx0 = canvas_x0()
+        in_canvas = (mp[0] >= cx0 and mp[1] < HEIGHT-PANEL_H)
 
         win.fill(BG)
-        draw_canvas_area(win,settings.open)
 
+        # Clip drawing to canvas area
+        canvas_surf = win.subsurface(
+            pygame.Rect(cx0, 0, WIDTH-cx0, HEIGHT-PANEL_H))
+        # We still draw on win but respect clip via subsurface
+
+        draw_canvas_area(win, vp, settings.open and settings._anim_x > -SETTINGS_W*0.5)
+
+        # ── Events ────────────────────────────────────────────────────────────
         for event in pygame.event.get():
-            if event.type==pygame.QUIT: running=False
+            if event.type == pygame.QUIT: running = False
 
-            if settings.open: settings.handle_event(event,p)
+            # ── Settings panel ──────────────────────────────────────────────
+            if settings.open: settings.handle_event(event, p)
 
-            if (event.type==pygame.MOUSEWHEEL
-                    and mode=="LOAD" and sel_load is not None):
-                rotate_sel_load(event.y*5.0)
+            # ── Middle mouse button: pan ─────────────────────────────────────
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 2 and in_canvas:
+                vp.start_pan(*mp)
 
-            if event.type==pygame.KEYDOWN:
-                k=event.key
-                if k in (pygame.K_q,pygame.K_ESCAPE): running=False
-                elif k==pygame.K_a: mode="ANCHOR"; sel_node=None; sel_load=None
-                elif k==pygame.K_l: mode="LOAD";   sel_node=None
-                elif k==pygame.K_m: mode="MANUAL"; sel_node=None; sel_load=None
-                elif k==pygame.K_s: settings.toggle()
-                elif k==pygame.K_f:
-                    idx=LABEL_CYCLE.index(label_mode)
-                    label_mode=LABEL_CYCLE[(idx+1)%len(LABEL_CYCLE)]
-                    status=f"Labels: {label_mode.upper()}"
-                elif k==pygame.K_c:
-                    anchors.clear(); loads.clear(); load_angles.clear()
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 2:
+                vp.stop_pan()
+
+            # ── Mouse motion: middle-drag pan ────────────────────────────────
+            if event.type == pygame.MOUSEMOTION:
+                if vp.is_panning:
+                    vp.update_pan(*mp)
+                if _rclick_pan:
+                    dx = mp[0]-_rclick_pan_pos[0]; dy = mp[1]-_rclick_pan_pos[1]
+                    if abs(dx)+abs(dy) > 4:
+                        _rclick_moved = True
+                    if _rclick_moved:
+                        vp.update_pan(*mp)
+
+            # ── Mouse wheel: zoom centred on cursor ──────────────────────────
+            if event.type == pygame.MOUSEWHEEL and in_canvas:
+                mods = pygame.key.get_mods()
+                if mode == "LOAD" and sel_load is not None:
+                    # Ctrl+wheel → angle, plain wheel → magnitude (LOAD mode)
+                    ctrl = bool(mods & pygame.KMOD_CTRL)
+                    if ctrl:
+                        rotate_angle(sel_load, event.y * 5.0)
+                    else:
+                        # Alt held → zoom even in LOAD mode
+                        if bool(mods & pygame.KMOD_ALT):
+                            vp.zoom_at(mp[0], mp[1], ZOOM_STEP ** event.y)
+                        else:
+                            change_magnitude(sel_load, event.y * 10.0)
+                            status = (f"Load: {load_magnitudes.get(sel_load,p.applied_load):.0f}N  "
+                                      f"{load_angles.get(sel_load,DEFAULT_LOAD_ANGLE)%360:.0f}°")
+                else:
+                    vp.zoom_at(mp[0], mp[1], ZOOM_STEP ** event.y)
+
+            # ── Key events ───────────────────────────────────────────────────
+            if event.type == pygame.KEYDOWN:
+                k = event.key; mods = pygame.key.get_mods()
+                shift = bool(mods & pygame.KMOD_SHIFT)
+
+                if k in (pygame.K_q, pygame.K_ESCAPE): running = False
+                elif k == pygame.K_a: mode = "ANCHOR"; sel_node = None; sel_load = None
+                elif k == pygame.K_l: mode = "LOAD";   sel_node = None
+                elif k == pygame.K_n: mode = "NOLOAD"; sel_node = None; sel_load = None
+                elif k == pygame.K_m: mode = "MANUAL"; sel_node = None; sel_load = None
+                elif k == pygame.K_s: settings.toggle()
+                elif k == pygame.K_f:
+                    idx = LABEL_CYCLE.index(label_mode)
+                    label_mode = LABEL_CYCLE[(idx+1) % len(LABEL_CYCLE)]
+                    status = f"Labels: {label_mode.upper()}"
+
+                # ── Viewport reset ───────────────────────────────────────────
+                elif k in (pygame.K_h, pygame.K_HOME):
+                    vp.reset(); status = "Viewport reset."
+
+                # ── Zoom keys (+/-) ──────────────────────────────────────────
+                elif k in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+                    vp.zoom_step(+1, mp[0], mp[1])
+                elif k in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                    vp.zoom_step(-1, mp[0], mp[1])
+
+                elif k == pygame.K_c:
+                    anchors.clear(); loads.clear(); noloads.clear()
+                    load_angles.clear(); load_magnitudes.clear()
                     members.clear(); forces.clear()
-                    buckled_set.clear(); manual_indices.clear()
-                    member_sizing.clear()
-                    sel_node=None; sel_load=None
-                    solved=False; total_len=float("inf"); status="Cleared."
-                elif k==pygame.K_r:
-                    fixed=get_fixed()
+                    buckled_set.clear(); manual_indices.clear(); member_sizing.clear()
+                    sel_node = None; sel_load = None
+                    solved = False; total_len = float("inf"); status = "Cleared."
+
+                elif k == pygame.K_r:
+                    fixed = get_fixed()
                     members.clear(); forces.clear()
                     buckled_set.clear(); manual_indices.clear(); member_sizing.clear()
                     for mm in fixed: manual_indices.add(len(members)); members.append(mm)
-                    solved=False; total_len=float("inf"); status="Auto members cleared."
-                elif (mode=="LOAD" and sel_load is not None
-                      and k in (pygame.K_LEFT,pygame.K_RIGHT,
-                                pygame.K_UP,  pygame.K_DOWN)):
-                    shift=bool(pygame.key.get_mods()&pygame.KMOD_SHIFT)
-                    step=(15.0 if k in (pygame.K_UP,pygame.K_DOWN) else 1.0)
-                    if shift: step*=10
-                    if k in (pygame.K_LEFT,pygame.K_DOWN): step=-step
-                    rotate_sel_load(step)
-                    status=f"Load angle: {load_angles[sel_load]%360:.0f}°"
-                elif k==pygame.K_SPACE:
+                    solved = False; total_len = float("inf"); status = "Auto members cleared."
+
+                elif k == pygame.K_LEFTBRACKET and mode == "LOAD" and sel_load is not None:
+                    change_magnitude(sel_load, -100.0 if shift else -10.0)
+                    status = f"Load: {load_magnitudes.get(sel_load,p.applied_load):.0f}N"
+                elif k == pygame.K_RIGHTBRACKET and mode == "LOAD" and sel_load is not None:
+                    change_magnitude(sel_load, 100.0 if shift else 10.0)
+                    status = f"Load: {load_magnitudes.get(sel_load,p.applied_load):.0f}N"
+
+                elif (mode == "LOAD" and sel_load is not None
+                      and k in (pygame.K_LEFT,pygame.K_RIGHT,pygame.K_UP,pygame.K_DOWN)):
+                    step = (15.0 if k in (pygame.K_UP,pygame.K_DOWN) else 1.0)
+                    if shift: step *= 10
+                    if k in (pygame.K_LEFT,pygame.K_DOWN): step = -step
+                    rotate_angle(sel_load, step)
+                    status = f"Angle: {load_angles[sel_load]%360:.0f}°"
+
+                elif k == pygame.K_SPACE:
                     do_solve()
 
-            if event.type==pygame.MOUSEBUTTONDOWN and not settings.any_active():
-                if (settings.open and mp[0]<SETTINGS_W
-                        and settings._anim_x>-SETTINGS_W*0.5): pass
-                elif mp[1]>=HEIGHT-PANEL_H: pass
-                elif event.button==3:
-                    target=nearest_node(mp,all_nodes)
-                    if target:
-                        if target in anchors: anchors.remove(target)
-                        if target in loads:
-                            loads.remove(target); load_angles.pop(target,None)
-                            if sel_load==target: sel_load=None
-                        new_m2,new_mm=[],set()
-                        for i,m in enumerate(members):
-                            if target not in m:
-                                if i in manual_indices: new_mm.add(len(new_m2))
-                                new_m2.append(m)
-                        members[:]=new_m2; manual_indices.clear(); manual_indices.update(new_mm)
-                        forces.clear(); buckled_set.clear(); member_sizing.clear()
-                        solved=False; total_len=float("inf"); status="Node removed."
-                elif event.button==1:
-                    if mode=="ANCHOR":
-                        if mp not in loads and mp not in anchors:
-                            anchors.append(mp)
+            # ── Mouse button down ────────────────────────────────────────────
+            if event.type == pygame.MOUSEBUTTONDOWN and not settings.any_active():
+                in_settings_panel = (settings.open and mp[0] < SETTINGS_W
+                                     and settings._anim_x > -SETTINGS_W*0.5)
+                in_panel = (mp[1] >= HEIGHT-PANEL_H)
+
+                if in_settings_panel or in_panel:
+                    pass   # handled elsewhere
+
+                elif event.button == 3:
+                    # Start right-click: might be pan or node-remove
+                    _rclick_pan     = True
+                    _rclick_pan_pos = mp
+                    _rclick_moved   = False
+                    vp.start_pan(*mp)   # tentatively start pan
+
+                elif event.button == 1 and in_canvas:
+                    # Convert click to world space
+                    wx, wy = vp.s2w(*mp)
+                    wmp = (wx, wy)   # world-space mouse position (float)
+                    # Snap to integer pixel grid for node placement
+                    wmp_i = (int(round(wx)), int(round(wy)))
+
+                    if mode == "ANCHOR":
+                        if wmp_i not in loads and wmp_i not in anchors and wmp_i not in noloads:
+                            anchors.append(wmp_i)
                             forces.clear(); buckled_set.clear(); member_sizing.clear()
-                            solved=False; total_len=float("inf")
-                    elif mode=="LOAD":
-                        clicked=nearest_node(mp,loads)
+                            solved = False; total_len = float("inf")
+
+                    elif mode == "LOAD":
+                        if sel_load is not None:
+                            delta = editor.handle_click(mp)
+                            if delta is not None:
+                                change_magnitude(sel_load, delta)
+                                status = f"Load: {load_magnitudes.get(sel_load,p.applied_load):.0f}N"
+                                continue
+
+                        clicked = nearest_node(mp, loads, vp)
                         if clicked:
-                            sel_load=clicked
-                            ang=load_angles.get(sel_load,DEFAULT_LOAD_ANGLE)%360
-                            status=f"Load node selected  angle={ang:.0f}°  scroll/arrows to rotate"
+                            sel_load = clicked
+                            mag = load_magnitudes.get(sel_load, p.applied_load)
+                            ang = load_angles.get(sel_load, DEFAULT_LOAD_ANGLE) % 360
+                            status = f"Selected: {mag:.0f}N  {ang:.0f}°  [/] ±10N  scroll=mag"
                         else:
-                            if mp not in anchors:
-                                loads.append(mp); load_angles[mp]=DEFAULT_LOAD_ANGLE
-                                sel_load=mp
+                            if wmp_i not in anchors and wmp_i not in noloads:
+                                loads.append(wmp_i)
+                                load_angles[wmp_i]     = DEFAULT_LOAD_ANGLE
+                                load_magnitudes[wmp_i] = p.applied_load
+                                sel_load = wmp_i
                                 forces.clear(); buckled_set.clear(); member_sizing.clear()
-                                solved=False; total_len=float("inf")
-                                status="Load placed  angle=90° (down)  scroll/arrows to rotate"
-                    elif mode=="MANUAL":
-                        clicked=nearest_node(mp,all_nodes)
+                                solved = False; total_len = float("inf")
+                                status = f"Load placed: {p.applied_load:.0f}N  90°"
+
+                    elif mode == "NOLOAD":
+                        if wmp_i not in anchors and wmp_i not in loads and wmp_i not in noloads:
+                            noloads.append(wmp_i)
+                            forces.clear(); buckled_set.clear(); member_sizing.clear()
+                            solved = False; total_len = float("inf")
+                            status = "No-load node placed."
+
+                    elif mode == "MANUAL":
+                        clicked = nearest_node(mp, all_nodes, vp)
                         if clicked:
                             if sel_node is None:
-                                sel_node=clicked; status="Click second node to connect."
-                            elif clicked!=sel_node:
-                                pair=(sel_node,clicked); rev=(clicked,sel_node)
+                                sel_node = clicked; status = "Click second node to connect."
+                            elif clicked != sel_node:
+                                pair = (sel_node, clicked); rev = (clicked, sel_node)
                                 if pair not in members and rev not in members:
-                                    members.append(pair); manual_indices.add(len(members)-1)
+                                    members.append(pair)
+                                    manual_indices.add(len(members)-1)
                                     forces.clear(); buckled_set.clear(); member_sizing.clear()
-                                    solved=False; total_len=float("inf")
-                                    status="Manual member added."
-                                else: status="Already exists."
-                                sel_node=None
-                            else: sel_node=None; status="Deselected."
+                                    solved = False; total_len = float("inf")
+                                    status = "Manual member added."
+                                else:
+                                    status = "Already exists."
+                                sel_node = None
+                            else:
+                                sel_node = None; status = "Deselected."
+
+            # ── Mouse button up ──────────────────────────────────────────────
+            if event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 3:
+                    vp.stop_pan()
+                    if not _rclick_moved:
+                        # Treat as a right-click: remove node
+                        target = nearest_node(mp, all_nodes, vp)
+                        if target:
+                            if target in anchors: anchors.remove(target)
+                            if target in loads:
+                                loads.remove(target)
+                                load_angles.pop(target, None)
+                                load_magnitudes.pop(target, None)
+                                if sel_load == target: sel_load = None
+                            if target in noloads: noloads.remove(target)
+                            new_m2, new_mm = [], set()
+                            for i, m in enumerate(members):
+                                if target not in m:
+                                    if i in manual_indices: new_mm.add(len(new_m2))
+                                    new_m2.append(m)
+                            members[:] = new_m2
+                            manual_indices.clear(); manual_indices.update(new_mm)
+                            forces.clear(); buckled_set.clear(); member_sizing.clear()
+                            solved = False; total_len = float("inf"); status = "Node removed."
+                    _rclick_pan = False
 
         # ── Draw members ───────────────────────────────────────────────────────
-        max_f=max((abs(f) for f in forces.values()),default=1.0)
-        for i,(a,b) in enumerate(members):
-            f=forces.get((a,b),forces.get((b,a),None))
-            sz=member_sizing.get((a,b),member_sizing.get((b,a),None))
-            draw_member_line(win,a,b,force=f,max_force=max_f,
+        max_f = max((abs(f) for f in forces.values()), default=1.0)
+        for i, (a, b) in enumerate(members):
+            f  = forces.get((a,b), forces.get((b,a), None))
+            sz = member_sizing.get((a,b), member_sizing.get((b,a), None))
+            draw_member_line(win, vp, a, b, force=f, max_force=max_f,
                              manual=(i in manual_indices),
                              buckled=((a,b) in buckled_set or (b,a) in buckled_set),
-                             label_mode=label_mode,font_tiny=font_tiny,p=p,
-                             sizing=sz)
+                             label_mode=label_mode, font_tiny=font_tiny, p=p, sizing=sz)
 
         # Manual preview line
-        if mode=="MANUAL" and sel_node:
-            Lpx=math.dist(sel_node,mp)
-            # Warn if exceeds the reference L_max, but don't block
-            col=(255,180,0) if Lpx>p.L_MAX_PX else SEL_COL
-            pygame.draw.line(win,col,sel_node,mp,1)
-            warn=" (may buckle — A* will try)" if Lpx>p.L_MAX_PX else ""
-            lbl=font_sm.render(f"{Lpx/p.pixels_per_m*100:.1f}cm{warn}",True,col)
-            win.blit(lbl,(mp[0]+12,mp[1]-18))
+        if mode == "MANUAL" and sel_node:
+            wx, wy = vp.s2w(*mp)
+            Lpx    = math.dist(sel_node, (wx, wy))
+            col    = (255,180,0) if Lpx > p.L_MAX_PX else SEL_COL
+            pygame.draw.line(win, col, vp.w2si(*sel_node), mp, 1)
+            warn = " (may buckle)" if Lpx > p.L_MAX_PX else ""
+            win.blit(font_sm.render(f"{Lpx/p.pixels_per_m*100:.1f}cm{warn}", True, col),
+                     (mp[0]+12, mp[1]-18))
 
         # ── Draw nodes ─────────────────────────────────────────────────────────
         for a in anchors:
-            draw_node(win,a,"anchor",hover=(a==hover_node and mode=="MANUAL"),selected=(a==sel_node))
+            draw_node(win, vp, a, "anchor",
+                      hover=(a==hover_node and mode in ("MANUAL","ANCHOR")),
+                      selected=(a==sel_node))
         for ld in loads:
-            is_sel=(ld==sel_load)
-            draw_node(win,ld,"load",hover=(ld==hover_node and mode in ("MANUAL","LOAD")),selected=is_sel)
-            draw_load_arrow(win,ld,load_angles.get(ld,DEFAULT_LOAD_ANGLE))
-            if is_sel and mode=="LOAD":
-                draw_angle_dial(win,ld,load_angles.get(ld,DEFAULT_LOAD_ANGLE),font_tiny,font_sm)
+            is_sel = (ld == sel_load)
+            draw_node(win, vp, ld, "load",
+                      hover=(ld==hover_node and mode in ("MANUAL","LOAD")),
+                      selected=is_sel)
+            draw_load_arrow(win, vp, ld,
+                            load_angles.get(ld, DEFAULT_LOAD_ANGLE),
+                            load_magnitudes.get(ld, p.applied_load),
+                            p, font_tiny)
+            if is_sel and mode == "LOAD":
+                editor.draw(win,
+                            vp.w2si(*ld),   # screen-space position for the dial
+                            load_angles.get(ld, DEFAULT_LOAD_ANGLE),
+                            load_magnitudes.get(ld, p.applied_load),
+                            font_tiny, font_sm, mp)
+        for nl in noloads:
+            draw_node(win, vp, nl, "noload",
+                      hover=(nl==hover_node and mode in ("MANUAL","NOLOAD")),
+                      selected=(nl==sel_node))
 
-        # ── Force table ────────────────────────────────────────────────────────
-        draw_force_table(win,fonts,members,forces,buckled_set,manual_indices,p,
+        # ── Overlay UI (screen-space, not affected by viewport) ────────────────
+        draw_force_table(win, fonts, members, forces, buckled_set, manual_indices, p,
                          sizing_map=member_sizing if label_mode=="sizing" else None)
+        if solved and member_sizing and label_mode == "sizing":
+            total_vol = sum(sz["volume_cm3"] for sz in member_sizing.values())
+            sv = font_sm.render(f"Total min material volume: {total_vol:.4f} cm³",
+                                True, (180,220,160))
+            win.blit(sv, (14, 8))
 
-        # ── Volume summary (sizing mode) ───────────────────────────────────────
-        if solved and member_sizing and label_mode=="sizing":
-            total_vol=sum(sz["volume_cm3"] for sz in member_sizing.values())
-            sv=font_sm.render(f"Total min material volume: {total_vol:.4f} cm³",True,(180,220,160))
-            win.blit(sv,(14,8))
+        draw_stress_legend(win, font_sm, font_tiny)
+        draw_zoom_indicator(win, vp, font_tiny)
+        settings.draw(win, fonts, p)
+        draw_status_bar(win, fonts, mode, status, solved, label_mode,
+                        len(members), total_len, p, sel_load,
+                        load_angles, load_magnitudes, vp)
 
-        # ── Colour legend ──────────────────────────────────────────────────────
-        draw_stress_legend(win,font_sm,font_tiny)
-
-        # ── Settings panel ─────────────────────────────────────────────────────
-        settings.draw(win,fonts,p)
-
-        # ── Status bar ─────────────────────────────────────────────────────────
-        draw_status_bar(win,fonts,mode,status,solved, label_mode,len(members),total_len,p,sel_load,load_angles)
+        # Pan cursor hint
+        if vp.is_panning or _rclick_pan:
+            pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_SIZEALL)
+        else:
+            pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
 
         pygame.display.flip()
         clock.tick(60)
@@ -1191,5 +1649,5 @@ def main():
     sys.exit()
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
