@@ -12,7 +12,10 @@ You place anchor nodes (supports) and load nodes (where forces act) on a canvas.
 
 Under the hood it's running an A\* search over the space of possible truss topologies, guided by a Steiner-MST lower-bound heuristic, and checking each candidate with a proper FEM solver (method of joints).
 
-![demo screenshot placeholder](docs/screenshot.png)
+<img width="1489" height="959" alt="image" src="https://github.com/user-attachments/assets/848ef786-d57e-4dff-bfa5-0ca7214e81af" />
+<img width="1502" height="959" alt="image" src="https://github.com/user-attachments/assets/49d968a2-934c-4728-9574-7baa7047a41a" />
+
+
 
 ---
 
