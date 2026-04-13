@@ -457,7 +457,7 @@ m = 2(3) − 2 = 4 members required
 
 **Critical problem:** Only 3 possible edges exist between 3 nodes, but Maxwell requires 4 members. This is **structurally impossible** with just 3 nodes — the solver will always fail.
 
-The fix is to add at least one no-load intermediate node, bringing j = 4:
+The fix is to add at least one anchor node, bringing j = 4:
 
 ```
 m = 2(4) − 2 = 6 members required
