@@ -12,7 +12,7 @@ This document is the technical reference for the AI Truss Builder. It explains e
 4. [The A\* Search Engine — `run_astar`](#4-the-a-search-engine--run_astar)
 5. [State Representation — `TrussStateV4`](#5-state-representation--trusstatev4)
 6. [The FEM Solver — `solve_truss`](#6-the-fem-solver--solve_truss)
-7. [The Heuristic — `steiner_lower_bound`](#7-the-heuristic--steiner_lower_bound)
+7. [The Heuristic — `MST`](#7-the-heuristic--MST)
 8. [Zobrist Incremental Hashing](#8-zobrist-incremental-hashing)
 9. [Maxwell Determinacy Pre-filter](#9-maxwell-determinacy-pre-filter)
 10. [Minimum Section Sizing](#10-minimum-section-sizing)
@@ -200,9 +200,9 @@ The system is solved with `numpy.linalg.lstsq`. The rank is checked — a rank-d
 
 ---
 
-## 7. The Heuristic — `steiner_lower_bound`
+## 7. The Heuristic — `Prim's MST algorithm`
 
-A\* needs an **admissible heuristic** — one that never overestimates the true remaining cost. The heuristic used here is a Steiner tree lower bound.
+A\* needs an **admissible heuristic** — one that never overestimates the true remaining cost. The heuristic used here is a Prim's Minimum Spanning tree.
 
 **The idea:** how much extra wire do we need to connect all required nodes (those not yet reachable from an anchor)?
 
